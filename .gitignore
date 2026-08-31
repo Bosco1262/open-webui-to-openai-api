@@ -1,0 +1,23 @@
+# 环境变量
+.env
+
+# 敏感数据 (抓取到的 Cookie 和 Token)
+session.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+.venv
+
+# Playwright
+playwright-browsers/
+
+# IDE
+.vscode/
+.idea/

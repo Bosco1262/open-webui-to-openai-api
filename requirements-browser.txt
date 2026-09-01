@@ -1,0 +1,8 @@
+# Install only when you need browser-based login credential capture.
+# If you already have an Open WebUI token, you can write session.json by hand,
+# in which case this file is not needed.
+#
+# 仅在需要「浏览器登录抓取凭证」时才安装。
+# 如果你已有 Open WebUI 的 Token，可手工编写 session.json，则无需安装本文件。
+-r requirements.txt
+playwright>=1.47

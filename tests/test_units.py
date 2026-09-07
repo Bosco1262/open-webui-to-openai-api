@@ -178,7 +178,7 @@ def test_model_normalization() -> None:
 
     extended = proxy.normalize_model(
         {
-            "id": "m1",
+            "id": "GLM-5.2-NVFP4",
             "created": 1788788099,
             "owned_by": "openai",
             "max_model_len": 131072,
@@ -187,7 +187,7 @@ def test_model_normalization() -> None:
                 "created_at": 1779326071,
                 "meta": {
                     "description": "A test model",
-                    "capabilities": {"vision": True, "usage": False, "bad": "x"},
+                    "capabilities": {"vision": True, "usage": False, "bad": "x", "builtin_tools": True},
                 },
                 "access_grants": [{"principal_id": "*"}],
             },
@@ -199,11 +199,22 @@ def test_model_normalization() -> None:
     check("created 优先取 info.created_at", extended.get("created") == 1779326071, str(extended))
     check("owned_by 优先取内层引擎归属", extended.get("owned_by") == "vllm", str(extended))
     check(
-        "扩展白名单透出",
-        extended.get("max_model_len") == 131072
-        and extended.get("description") == "A test model"
-        and extended.get("capabilities") == {"vision": True, "usage": False},
+        "通用模板上下文字段 + 兼容别名",
+        extended.get("max_context_length") == 131072
+        and extended.get("context_length") == 131072
+        and extended.get("max_model_len") == 131072,
         str(extended),
+    )
+    check("quantization 从模型名解析", extended.get("quantization") == "NVFP4", str(extended))
+    check(
+        "扩展白名单透出（含派生 function_calling）",
+        extended.get("description") == "A test model"
+        and extended.get("capabilities") == {"vision": True, "usage": False, "builtin_tools": True, "function_calling": True},
+        str(extended),
+    )
+    check(
+        "无量化标识时不输出 quantization",
+        proxy.normalize_model({"id": "plain-model", "max_model_len": 100}).get("quantization") is None,
     )
     check(
         "私有字段不透出",

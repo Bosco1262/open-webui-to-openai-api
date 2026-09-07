@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 from secrets import compare_digest
@@ -324,19 +325,31 @@ def _auth_failure_response(status_code: int) -> JSONResponse:
 # Model list normalization
 # 模型列表规范化
 # --------------------------------------------------------------------------- #
+# Quantization tokens recognizable in model ids: NVFP4, FP8, FP16, INT8, GPTQ, AWQ, ...
+# 模型名中可识别的量化标识：NVFP4、FP8、FP16、INT8、GPTQ、AWQ 等
+_QUANT_PATTERN = re.compile(
+    r"\b(NVFP4|FP4|FP8|FP16|INT8|INT4|GPTQ(?:-?[0-9]+BIT)?|AWQ|GGUF|Q[0-9](?:_[A-Z0-9]+)*)\b",
+    re.IGNORECASE,
+)
+
+
 def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     """Collapse an upstream model object into the OpenAI model structure.
 
-    Standard fields stay intact; a small whitelist of safe, useful extras
-    (max_model_len, description, capabilities) is preserved when present.
-    Private upstream fields (user_id, access_grants, permission, urlIdx, ...)
-    are never exposed.
+    Standard fields stay intact; a whitelist of safe, useful extras aligned
+    with the generic /v1/models template is preserved when present:
+    max_model_len (kept for compatibility) plus max_context_length and
+    context_length, quantization (parsed from the model id), capabilities
+    (with a derived function_calling flag) and description. Private upstream
+    fields (user_id, access_grants, permission, urlIdx, ...) are never exposed.
 
     把上游的模型对象收敛成 OpenAI 的 model 结构。
-    
-    标准字段原样保留，另有一份白名单透出安全且有用的扩展字段
-    （max_model_len、description、capabilities）；上游私有字段
-    （user_id、access_grants、permission、urlIdx 等）一律不透出。
+
+    标准字段原样保留，另有一份白名单按通用 /v1/models 模板透出安全且
+    有用的扩展字段：max_model_len（兼容保留）+ max_context_length/
+    context_length、quantization（从模型名解析）、capabilities（含派生的
+    function_calling）与 description；上游私有字段（user_id、access_grants、
+    permission、urlIdx 等）一律不透出。
     """
     if isinstance(raw, str):
         return {"id": raw, "object": "model", "created": 0, "owned_by": "openai"}
@@ -385,9 +398,24 @@ def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     # 精确的 4 字段 OpenAI 结构。
     max_model_len = raw.get("max_model_len") or openai_obj.get("max_model_len")
     try:
-        model["max_model_len"] = int(max_model_len)
+        context_length = int(max_model_len)
     except (TypeError, ValueError):
-        pass
+        context_length = None
+    if context_length is not None:
+        # Generic-template field names; max_model_len stays as a compatibility alias
+        # 通用模板字段名；max_model_len 作为兼容别名保留
+        model["max_model_len"] = context_length
+        model["max_context_length"] = context_length
+        model["context_length"] = context_length
+
+    # Quantization is not a dedicated upstream field; parse it from the model id
+    # (e.g. "GLM-5.2-NVFP4" -> "NVFP4"). Omitted when nothing matches.
+    #
+    # 量化信息不是上游的独立字段，从模型名解析（如 "GLM-5.2-NVFP4" ->
+    # "NVFP4"）。匹配不到时不输出该字段。
+    quant_match = _QUANT_PATTERN.search(str(model_id))
+    if quant_match:
+        model["quantization"] = quant_match.group(1).upper()
 
     description = meta.get("description")
     if description:
@@ -397,6 +425,9 @@ def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     if isinstance(capabilities, dict):
         caps = {k: v for k, v in capabilities.items() if isinstance(v, bool)}
         if caps:
+            # Derived flag: builtin_tools maps onto the template's function_calling
+            # 派生字段：builtin_tools 对应通用模板的 function_calling
+            caps["function_calling"] = bool(caps.get("builtin_tools", False))
             model["capabilities"] = caps
 
     return model

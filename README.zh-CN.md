@@ -30,7 +30,7 @@ flowchart LR
 
 - **凭证替换**：对外用你自定义的 `PROXY_API_KEY`，对内替换成浏览器抓来的 `Authorization` / `Cookie`，上游永远看不到你的 Proxy Key。
 - **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀，请求返回 404（路由不存在）时还会自动回退到另一个前缀。
-- **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按白名单透出安全且有用的扩展字段（`max_model_len`、`description`、`capabilities`）；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
+- **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按通用模板白名单透出扩展字段：`max_context_length` / `context_length`（`max_model_len` 作为兼容别名保留）、`quantization`（从模型名解析，如 `NVFP4`）、`capabilities`（含派生的 `function_calling`）与 `description`；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
 
 ## 特性
 

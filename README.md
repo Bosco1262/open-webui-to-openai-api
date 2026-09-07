@@ -30,7 +30,7 @@ Key points:
 
 - **Credential swapping**: externally it presents your custom `PROXY_API_KEY`, while internally it swaps in the browser-captured `Authorization` / `Cookie` — the upstream never sees your proxy key.
 - **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup, and automatically falls back to the other prefix when a request returns 404 (route not found).
-- **Response normalization**: `/v1/models` collapses upstream model objects (with private fields like `info`, `params`, `access_grants`) into the standard `{id, object, created, owned_by}`.
+- **Response normalization**: `/v1/models` collapses upstream model objects into the standard `{id, object, created, owned_by}`, plus a whitelist of safe extras (`max_model_len`, `description`, `capabilities`). Private fields (`user_id`, `access_grants`, `permission`, `urlIdx`, ...) are never exposed.
 
 ## Features
 

@@ -327,7 +327,16 @@ def _auth_failure_response(status_code: int) -> JSONResponse:
 def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     """Collapse an upstream model object into the OpenAI model structure.
 
+    Standard fields stay intact; a small whitelist of safe, useful extras
+    (max_model_len, description, capabilities) is preserved when present.
+    Private upstream fields (user_id, access_grants, permission, urlIdx, ...)
+    are never exposed.
+
     把上游的模型对象收敛成 OpenAI 的 model 结构。
+    
+    标准字段原样保留，另有一份白名单透出安全且有用的扩展字段
+    （max_model_len、description、capabilities）；上游私有字段
+    （user_id、access_grants、permission、urlIdx 等）一律不透出。
     """
     if isinstance(raw, str):
         return {"id": raw, "object": "model", "created": 0, "owned_by": "openai"}
@@ -339,7 +348,18 @@ def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     if not model_id:
         return None
 
-    created = raw.get("created")
+    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+    openai_obj = raw.get("openai") if isinstance(raw.get("openai"), dict) else {}
+
+    # info.created_at is the model's real creation time; the "created" on the
+    # OpenAI layer is the serving engine's start time, not the model's.
+    #
+    # info.created_at 才是模型真实创建时间；OpenAI 层的 created 是推理引擎
+    # 的启动时间，并非模型本身的。
+    created = info.get("created_at")
+    if created is None:
+        created = raw.get("created")
     if created is None:
         created = raw.get("created_at")
     try:
@@ -347,14 +367,39 @@ def normalize_model(raw: Any) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         created = 0
 
-    owned_by = raw.get("owned_by") or raw.get("user_id") or "openai"
+    # Prefer the inner engine attribution (e.g. "vllm") over the OpenAI-layer default
+    # 优先取内层引擎归属（如 "vllm"），而非 OpenAI 层的默认值
+    owned_by = openai_obj.get("owned_by") or raw.get("owned_by") or "openai"
 
-    return {
+    model: Dict[str, Any] = {
         "id": str(model_id),
         "object": "model",
         "created": created,
         "owned_by": str(owned_by),
     }
+
+    # Whitelisted extras: only emitted when the upstream provides them, so
+    # minimal/legacy model objects keep the exact 4-field OpenAI shape.
+    #
+    # 白名单扩展字段：上游提供时才输出，极简/老版本模型对象仍保持
+    # 精确的 4 字段 OpenAI 结构。
+    max_model_len = raw.get("max_model_len") or openai_obj.get("max_model_len")
+    try:
+        model["max_model_len"] = int(max_model_len)
+    except (TypeError, ValueError):
+        pass
+
+    description = meta.get("description")
+    if description:
+        model["description"] = str(description)
+
+    capabilities = meta.get("capabilities")
+    if isinstance(capabilities, dict):
+        caps = {k: v for k, v in capabilities.items() if isinstance(v, bool)}
+        if caps:
+            model["capabilities"] = caps
+
+    return model
 
 
 def extract_model_list(payload: Any) -> List[Any]:

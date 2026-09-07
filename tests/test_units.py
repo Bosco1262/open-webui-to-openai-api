@@ -176,6 +176,44 @@ def test_model_normalization() -> None:
     )
     check("非对象类型返回 None", proxy.normalize_model(12345) is None)
 
+    extended = proxy.normalize_model(
+        {
+            "id": "m1",
+            "created": 1788788099,
+            "owned_by": "openai",
+            "max_model_len": 131072,
+            "info": {
+                "user_id": "secret-user",
+                "created_at": 1779326071,
+                "meta": {
+                    "description": "A test model",
+                    "capabilities": {"vision": True, "usage": False, "bad": "x"},
+                },
+                "access_grants": [{"principal_id": "*"}],
+            },
+            "urlIdx": 3,
+            "permission": [],
+            "openai": {"owned_by": "vllm", "max_model_len": 999},
+        }
+    )
+    check("created 优先取 info.created_at", extended.get("created") == 1779326071, str(extended))
+    check("owned_by 优先取内层引擎归属", extended.get("owned_by") == "vllm", str(extended))
+    check(
+        "扩展白名单透出",
+        extended.get("max_model_len") == 131072
+        and extended.get("description") == "A test model"
+        and extended.get("capabilities") == {"vision": True, "usage": False},
+        str(extended),
+    )
+    check(
+        "私有字段不透出",
+        "user_id" not in extended
+        and "access_grants" not in extended
+        and "urlIdx" not in extended
+        and "permission" not in extended,
+        str(extended),
+    )
+
 
 def test_model_list_extraction() -> None:
     print("\n--- Model list shape compatibility / 模型列表结构兼容 ---")

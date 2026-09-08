@@ -552,6 +552,80 @@ def run_cors_case(server_url: str) -> None:
         proxy.stop()
 
 
+def run_reasoning_case(server_url: str) -> None:
+    print("\n=== Scenario: reasoning-effort probe & cache / 场景：思考挡位探测与缓存 ===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-reasoning-"))
+    session_file = make_session(tmp_dir / "session.json")
+    cache_file = tmp_dir / "reasoning_cache.json"
+    proxy = ProxyProcess(
+        server_url,
+        session_file,
+        "v1",
+        extra_env={"REASONING_CACHE_FILE": str(cache_file)},
+    )
+    try:
+        if not proxy.wait():
+            check("[reasoning] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
+
+        # The startup refresh runs in the background; poll until the probe lands.
+        # 启动时的刷新在后台进行；轮询直到探测结果落进 /v1/models。
+        llama_reasoning = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            resp = client.get("/v1/models", headers=headers())
+            data = (resp.json() or {}).get("data") or []
+            llama = next((m for m in data if m.get("id") == "llama3:latest"), {})
+            llama_reasoning = llama.get("reasoning")
+            if llama_reasoning:
+                break
+            time.sleep(0.3)
+
+        check("[reasoning] 探测完成后 /v1/models 带 reasoning 字段", llama_reasoning is not None, str(llama_reasoning))
+        if llama_reasoning:
+            check(
+                "[reasoning] 全挡位模型枚举完整",
+                llama_reasoning.get("supported_efforts")
+                == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                str(llama_reasoning),
+            )
+            check(
+                "[reasoning] 默认挡位为 medium",
+                llama_reasoning.get("default_effort") == "medium",
+                str(llama_reasoning),
+            )
+            check(
+                "[reasoning] 含 none 时非强制思考",
+                llama_reasoning.get("mandatory") is False
+                and llama_reasoning.get("default_enabled") is True,
+                str(llama_reasoning),
+            )
+
+        resp = client.get("/v1/models", headers=headers())
+        data = (resp.json() or {}).get("data") or []
+        legacy = next((m for m in data if m.get("id") == "legacy-model"), {})
+        check(
+            "[reasoning] 部分挡位模型按上游实际枚举",
+            (legacy.get("reasoning") or {}).get("supported_efforts") == ["none", "low", "medium", "high"],
+            str(legacy.get("reasoning")),
+        )
+        unprobeable = next((m for m in data if m.get("id") == REASONING_MODEL), {})
+        check(
+            "[reasoning] 上游不校验哨兵值的模型不带 reasoning 字段",
+            "reasoning" not in unprobeable,
+            str(unprobeable),
+        )
+        check(
+            "[reasoning] 缓存文件已生成",
+            cache_file.exists() and "models" in (cache_file.read_text(encoding="utf-8") or ""),
+        )
+
+        client.close()
+    finally:
+        proxy.stop()
+
+
 def main() -> int:
     run_bad_config_case()
 
@@ -566,6 +640,7 @@ def main() -> int:
         run_case(server.base_url, "legacy", "/api")
         run_missing_session_case(server.base_url)
         run_cors_case(server.base_url)
+        run_reasoning_case(server.base_url)
     finally:
         server.stop()
 

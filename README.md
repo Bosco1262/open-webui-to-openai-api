@@ -111,6 +111,7 @@ Common commands:
 python app.py              # Start the service (logs in first if needed)
 python app.py --login      # Force re-login and refresh credentials
 python app.py --check      # Only validate credentials and upstream connectivity, print a summary, then exit
+python app.py --probe      # Force a re-probe of every model's reasoning levels and refresh the cache
 python app.py --port 9000  # Temporarily override the listen port
 ```
 
@@ -185,7 +186,7 @@ for await (const part of stream) {
 | ---- | ---------------------- | -- | ---------------------------------------------------------------- |
 | GET  | `/`                    | No* | Service info and registered endpoints; the upstream address is returned only with a valid key |
 | GET  | `/healthz`             | No* | Health check always 200; upstream address and probed prefix returned only with a valid key |
-| GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure                    |
+| GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure, with reasoning-effort info attached |
 | POST | `/v1/chat/completions` | Yes | Chat completions, supports `stream: true`                         |
 | POST | `/v1/embeddings`       | Yes | Embeddings (upstream must support them)                           |
 | ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path                   |
@@ -209,12 +210,47 @@ Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`. If `PROX
 | `REQUEST_TIMEOUT`     | `300`                   | Total upstream request timeout (seconds)                                                             |
 | `CONNECT_TIMEOUT`     | `10`                    | Upstream connect timeout (seconds)                                                                   |
 | `SESSION_FILE`        | `session.json`          | Credential file path                                                                                 |
+| `REASONING_CACHE_FILE` | `reasoning_cache.json` | Reasoning-effort cache file path                                                                     |
+| `REASONING_PROBE_CONCURRENCY` | `4`             | Concurrency of the reasoning-effort probe                                                            |
+| `REASONING_PROBE_TIMEOUT`     | `30`            | Per-model probe timeout (seconds)                                                                   |
+| `REASONING_PROBE_WAIT`        | `5`             | Max seconds `/v1/models` waits for a missing-model probe before answering; `0` = answer immediately |
 | `MODEL_ALIASES`       | empty                   | JSON object, model name mapping                                                                      |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`; invalid values fall back to `INFO`     |
 | `DEBUG`               | `false`                 | When `true`, equivalent to `LOG_LEVEL=DEBUG`                                                          |
 | `LOGIN_TIMEOUT`       | `600`                   | Max seconds to wait for the browser login                                                            |
 | `LOGIN_QUIET_PERIOD`  | `6`                     | Seconds to keep observing after credentials are captured                                             |
 | `LOGIN_HEADLESS`      | `false`                 | Whether to launch the browser headless                                                               |
+
+## Reasoning-effort probing (reasoning_effort)
+
+`/v1/models` attaches a `reasoning` object to each model declaring the reasoning levels it supports:
+
+```json
+{
+  "id": "GLM-5.3-Flash",
+  "object": "model",
+  "...": "...",
+  "reasoning": {
+    "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "default_effort": "medium",
+    "default_enabled": true,
+    "mandatory": false
+  }
+}
+```
+
+**How it works**: the upstream (vLLM et al.) validates `reasoning_effort` as a Literal enum. The proxy sends each model a minimal completion request carrying the sentinel `"__probe__"` (`max_tokens=1`); the validation fails with a 400 whose error text conveniently enumerates every accepted level (`Input should be 'none', 'low', 'medium' or 'high'`). Validation happens before generation, so **a probe costs zero tokens**.
+
+**Caching**: levels are model-specific, so results are persisted to `reasoning_cache.json`. On every startup the cache is reused as-is as long as the model list is unchanged (the log shows "skipping probe"); when models are added or removed, only the new ones get probed. If `/v1/models` notices a model missing from the cache at runtime, it triggers a background refresh and by default waits up to 5 seconds (`REASONING_PROBE_WAIT`) for the probe to finish before answering -- probes typically complete in well under a second, so the first request usually gets full info; on timeout it answers without the field, which appears on the next request.
+
+**Derivation rules** (the probe only reveals the accepted set; the rest is heuristic):
+
+- `supported_efforts`: exactly what the upstream validation accepts, in canonical `none → max` order;
+- `default_effort`: `medium` when supported, otherwise the median level;
+- `mandatory`: `true` when `none` is absent, i.e. thinking cannot be turned off;
+- `default_enabled`: always `true` (the field is accepted, so reasoning is on by default).
+
+Force a full re-probe with `python app.py --probe` (useful after an upstream redeploy that keeps model names but changes levels).
 
 ## Credentials (session.json)
 

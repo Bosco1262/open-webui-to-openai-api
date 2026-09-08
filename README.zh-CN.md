@@ -111,6 +111,7 @@ python app.py
 python app.py              # 启动服务（必要时先登录）
 python app.py --login      # 强制重新登录，刷新凭证
 python app.py --check      # 只校验凭证与上游连通性，打印摘要后退出
+python app.py --probe      # 强制重探所有模型的思考挡位并刷新缓存
 python app.py --port 9000  # 临时覆盖监听端口
 ```
 
@@ -185,7 +186,7 @@ for await (const part of stream) {
 | ---- | ---------------------- | -- | ------------------------- |
 | GET  | `/`                    | 否* | 服务信息与已注册端点；上游地址仅在带 Key 时返回 |
 | GET  | `/healthz`             | 否* | 健康检查恒 200；上游地址与探测前缀仅在带 Key 时返回 |
-| GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构      |
+| GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构，并附带思考挡位信息   |
 | POST | `/v1/chat/completions` | 是  | 对话补全，支持 `stream: true`    |
 | POST | `/v1/embeddings`       | 是  | 向量嵌入（上游需支持）               |
 | ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径             |
@@ -209,12 +210,47 @@ for await (const part of stream) {
 | `REQUEST_TIMEOUT`     | `300`                   | 上游请求总超时（秒）                             |
 | `CONNECT_TIMEOUT`     | `10`                    | 连接上游超时（秒）                              |
 | `SESSION_FILE`        | `session.json`          | 凭证文件路径                                 |
+| `REASONING_CACHE_FILE` | `reasoning_cache.json` | 思考挡位缓存文件路径                             |
+| `REASONING_PROBE_CONCURRENCY` | `4`             | 挡位探测的并发数                               |
+| `REASONING_PROBE_TIMEOUT`     | `30`            | 单个模型挡位探测的超时（秒）                        |
+| `REASONING_PROBE_WAIT`        | `5`             | `/v1/models` 发现挡位缺失时等待探测完成的最长秒数，`0` = 立即返回 |
 | `MODEL_ALIASES`       | 空                       | JSON 对象，模型名映射                          |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`，非法值回退 `INFO` |
 | `DEBUG`               | `false`                 | 为 `true` 时等价于 `LOG_LEVEL=DEBUG`        |
 | `LOGIN_TIMEOUT`       | `600`                   | 浏览器登录最长等待秒数                            |
 | `LOGIN_QUIET_PERIOD`  | `6`                     | 抓到凭证后继续观察的秒数                           |
 | `LOGIN_HEADLESS`      | `false`                 | 是否无头启动浏览器                              |
+
+## 思考挡位探测（reasoning_effort）
+
+`/v1/models` 会为每个模型附带一个 `reasoning` 字段，声明该模型支持的思考挡位：
+
+```json
+{
+  "id": "GLM-5.3-Flash",
+  "object": "model",
+  "...": "...",
+  "reasoning": {
+    "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "default_effort": "medium",
+    "default_enabled": true,
+    "mandatory": false
+  }
+}
+```
+
+**探测原理**：上游（vLLM 等）把 `reasoning_effort` 声明为 Literal 枚举校验。本代理向每个模型发送一个携带哨兵值 `"__probe__"` 的最小补全请求（`max_tokens=1`），上游校验失败返回 400，错误文本恰好枚举该模型接受的全部挡位（`Input should be 'none', 'low', 'medium' or 'high'`）。校验发生在生成之前，因此**一次探测的 token 成本为零**。
+
+**缓存策略**：挡位与模型挂钩，探测结果持久化到 `reasoning_cache.json`。之后每次启动，只要模型列表没有变化就直接复用缓存（日志显示"跳过探测"）；模型列表有增删时，只探测新增的模型。运行期间 `/v1/models` 发现缓存未覆盖的新模型时，会触发后台补探，并默认最多等待 5 秒（`REASONING_PROBE_WAIT`）让探测完成再返回——探测通常亚秒级完成，客户端首次请求即可拿到完整挡位；超时则先返回现有内容，字段在下次请求出现。
+
+**字段推导规则**（探测只能揭示"接受哪些值"，其余字段为启发式推导）：
+
+- `supported_efforts`：上游校验接受的确切集合，按 `none → max` 规范顺序输出；
+- `default_effort`：支持 `medium` 则为 `medium`，否则取中位数挡位；
+- `mandatory`：集合中没有 `none` 时为 `true`，即无法关闭思考；
+- `default_enabled`：恒为 `true`（字段被接受即思考默认开启）。
+
+强制全量重探：`python app.py --probe`（适用于上游重新部署后模型名未变、挡位却变了的情况）。
 
 ## 凭证（session.json）
 

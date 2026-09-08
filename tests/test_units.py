@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import app as proxy  # noqa: E402
 import config as config_module  # noqa: E402
 import lang as lang_module  # noqa: E402
+import reasoning_cache as rcache  # noqa: E402
 import session_store as store  # noqa: E402
 
 PASSED: list = []
@@ -362,6 +363,124 @@ def test_language_detection() -> None:
         lang_module.configure(lang_module.detect_system_language())
 
 
+def _vllm_probe_error(efforts: list) -> str:
+    """
+    Rebuild the vLLM-style validation error captured from a real upstream
+    (as JSON-wrapped by Open WebUI), for a given accepted-efforts list.
+
+    按给定挡位集合重建从真实上游捕获的 vLLM 风格校验错误
+    （含 Open WebUI 的 JSON 包裹层）。
+    """
+    import json
+
+    quoted = ", ".join(f"'{e}'" for e in efforts[:-1]) + f" or '{efforts[-1]}'"
+    detail = (
+        "1 validation error:\n"
+        "  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort'), "
+        f"'msg': \"Input should be {quoted}\", "
+        "'input': '__probe__', "
+        f"'ctx': {{'expected': \"{quoted}\"}}}}"
+    )
+    return json.dumps({"detail": detail})
+
+
+def test_reasoning_effort_parsing() -> None:
+    print("\n--- Reasoning-effort error parsing / 思考挡位报错解析 ---")
+    full = _vllm_probe_error(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    check(
+        "解析 7 挡位的真实报错",
+        rcache.extract_supported_efforts(full)
+        == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        full[:200],
+    )
+    partial = _vllm_probe_error(["none", "low", "medium", "high"])
+    check(
+        "解析 4 挡位的真实报错",
+        rcache.extract_supported_efforts(partial) == ["none", "low", "medium", "high"],
+        partial[:200],
+    )
+    check("非 reasoning_effort 的报错不解析", rcache.extract_supported_efforts(
+        "1 validation error:\n  {'type': 'literal_error', 'loc': ('body', 'stop'), "
+        "'msg': \"Input should be 'stop' or 'length'\", 'input': 'x'}"
+    ) == [])
+    check(
+        "同构但值非挡位的报错不解析",
+        rcache.extract_supported_efforts(
+            "loc: ('body', 'reasoning_effort'), msg: \"Input should be 'left' or 'right'\""
+        ) == [],
+    )
+    check("空文本返回空", rcache.extract_supported_efforts("") == [])
+    check("普通 500 文本返回空", rcache.extract_supported_efforts("Internal Server Error") == [])
+
+
+def test_reasoning_info_derivation() -> None:
+    print("\n--- Reasoning info derivation / 思考挡位信息推导 ---")
+    info = rcache.build_reasoning_info(["high", "none", "medium", "low", "minimal", "xhigh", "max"])
+    check(
+        "supported_efforts 按规范顺序排序",
+        info["supported_efforts"] == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        str(info),
+    )
+    check("含 medium 时默认 medium", info["default_effort"] == "medium", str(info))
+    check("含 none 时非强制", info["mandatory"] is False, str(info))
+    check("default_enabled 恒为 True", info["default_enabled"] is True, str(info))
+
+    no_none = rcache.build_reasoning_info(["high", "medium", "low", "minimal"])
+    check("无 none 时判定为强制思考", no_none["mandatory"] is True, str(no_none))
+    check("无 none 时默认 medium", no_none["default_effort"] == "medium", str(no_none))
+
+    no_medium = rcache.build_reasoning_info(["none", "low", "high"])
+    check(
+        "无 medium 时取中位数挡位",
+        no_medium["default_effort"] == "low",
+        str(no_medium),
+    )
+    check("未知挡位排在末尾且透传", rcache.build_reasoning_info(
+        ["turbo", "low", "none"]
+    )["supported_efforts"] == ["none", "low", "turbo"])
+    check("空挡位返回 None", rcache.build_reasoning_info([]) is None)
+
+
+def test_reasoning_cache_store() -> None:
+    print("\n--- Reasoning cache persistence / 思考挡位缓存 ---")
+    tmp = Path(tempfile.mkdtemp())
+    cache_file = tmp / "reasoning_cache.json"
+    cache = rcache.ReasoningCache(cache_file)
+
+    check("初始无条目", len(cache) == 0)
+    missing = cache.sync_with_models(["a", "b"])
+    check("未缓存的模型需要探测", missing == ["a", "b"], str(missing))
+
+    cache.update("a", ["none", "low", "medium", "high"])
+    cache.update("b", [])  # probed but unprobeable
+    cache.save()
+    check("缓存文件已生成", cache_file.exists())
+
+    # Reload from disk in a fresh instance
+    fresh = rcache.ReasoningCache(cache_file)
+    fresh.load()
+    check("重新加载后条目数一致", len(fresh) == 2)
+    info = fresh.get("a")
+    check(
+        "重新加载后挡位完整",
+        info is not None and info["supported_efforts"] == ["none", "low", "medium", "high"],
+        str(info),
+    )
+    check("不可探测模型不输出 reasoning 字段", fresh.get("b") is None)
+    check("未探测模型返回 None", fresh.get("c") is None)
+
+    missing = fresh.sync_with_models(["a", "c"])
+    check("模型消失后条目被清除且新增模型待探", missing == ["c"] and len(fresh) == 1, str(missing))
+    forced = fresh.sync_with_models(["a"], force=True)
+    check("force 时全部模型重探", forced == ["a"], str(forced))
+
+    # Corrupt cache file must not crash, just start empty
+    cache_file.write_text("{ not json", encoding="utf-8")
+    broken = rcache.ReasoningCache(cache_file)
+    broken.load()
+    check("损坏的缓存文件不致崩溃", len(broken) == 0)
+
+
 if __name__ == "__main__":
     test_session_roundtrip()
     test_session_file()
@@ -372,6 +491,9 @@ if __name__ == "__main__":
     test_error_shape()
     test_credentials_are_valid()
     test_language_detection()
+    test_reasoning_effort_parsing()
+    test_reasoning_info_derivation()
+    test_reasoning_cache_store()
 
     total = len(PASSED) + len(FAILED)
     print("\n" + "=" * 60)

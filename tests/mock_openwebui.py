@@ -34,6 +34,20 @@ ABORT_MODEL = "abort-model"
 # 推理模型：响应带 reasoning_content 思考内容，用于验证代理对扩展字段无损透传
 REASONING_MODEL = "reasoning-content-model"
 
+# Models whose chat endpoint validates reasoning_effort like vLLM does, plus the
+# accepted levels per model; used to exercise the reasoning-effort probe. Models
+# NOT in this mapping silently accept any reasoning_effort (simulating an
+# upstream that ignores the field), and REASONING_MODEL is deliberately kept
+# out to cover the "unprobeable" branch.
+#
+# chat 端点像 vLLM 一样校验 reasoning_effort 的模型及其接受的挡位；用于测试
+# 思考挡位探测。不在此映射中的模型会静默接受任意 reasoning_effort（模拟忽略
+# 该字段的上游），REASONING_MODEL 有意留在外面以覆盖"不可探测"分支。
+PROBEABLE_MODELS: Dict[str, list] = {
+    "llama3:latest": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "legacy-model": ["none", "low", "medium", "high"],
+}
+
 MODELS = {
     "object": "list",
     "data": [
@@ -185,6 +199,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if model == ABORT_MODEL:
             self._send_sse_then_abort()
+            return
+
+        # Reasoning-effort probe: reply with a vLLM-style validation error that
+        # enumerates the accepted levels for this model.
+        #
+        # 思考挡位探测：返回 vLLM 风格的校验错误，枚举该模型接受的挡位。
+        if payload.get("reasoning_effort") == "__probe__" and model in PROBEABLE_MODELS:
+            efforts = PROBEABLE_MODELS[model]
+            quoted = ", ".join(f"'{e}'" for e in efforts[:-1]) + f" or '{efforts[-1]}'"
+            self._send_json(
+                400,
+                {
+                    "detail": (
+                        "1 validation error:\n"
+                        "  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort'), "
+                        f"'msg': \"Input should be {quoted}\", "
+                        "'input': '__probe__', "
+                        f"'ctx': {{'expected': \"{quoted}\"}}}}"
+                    )
+                },
+            )
             return
 
         if model == REASONING_MODEL:

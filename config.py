@@ -150,6 +150,13 @@ class Settings:
     # ---------- 凭证 ----------
     session_file: Path
 
+    # ---------- Reasoning-effort probe ----------
+    # ---------- 思考挡位探测 ----------
+    reasoning_cache_file: Path
+    reasoning_probe_concurrency: int = 4
+    reasoning_probe_timeout: float = 30.0
+    reasoning_probe_wait: float = 5.0
+
     # ---------- Behavior ----------
     # ---------- 行为 ----------
     model_aliases: Dict[str, str] = field(default_factory=dict)
@@ -221,6 +228,22 @@ def load_settings() -> Settings:
         proxy_port=_get_int("PROXY_PORT", 8000),
         proxy_api_key=os.getenv("PROXY_API_KEY", "").strip(),
         session_file=Path(os.getenv("SESSION_FILE", "session.json")).expanduser(),
+        # Reasoning-effort cache: refreshed only when the model list changes;
+        # concurrency/timeout bound the per-model probe requests.
+        #
+        # 思考挡位缓存：仅在模型列表变化时刷新；并发数/超时约束逐模型的
+        # 探测请求。
+        reasoning_cache_file=Path(
+            os.getenv("REASONING_CACHE_FILE", "reasoning_cache.json")
+        ).expanduser(),
+        reasoning_probe_concurrency=max(1, _get_int("REASONING_PROBE_CONCURRENCY", 4)),
+        reasoning_probe_timeout=_get_float("REASONING_PROBE_TIMEOUT", 30.0, minimum=1.0),
+        # How long /v1/models may block waiting for a missing-models probe to
+        # finish before serving without the reasoning field (0 = never wait).
+        #
+        # /v1/models 在返回前最多等待缺失模型的探测完成多久
+        # （0 = 从不等待，直接返回）。
+        reasoning_probe_wait=_get_float("REASONING_PROBE_WAIT", 5.0, minimum=0.0),
         model_aliases=_get_aliases("MODEL_ALIASES"),
         cors_origins=_get_str_list("PROXY_CORS_ORIGINS"),
         debug=debug,

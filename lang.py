@@ -246,6 +246,57 @@ _MESSAGES: Dict[str, Tuple[str, str]] = {
         "Output language: zh / en / auto (default: auto = follow the system language, English if undetectable)",
         "输出语言：zh / en / auto（默认 auto = 系统语言，检测不到时用英文）",
     ),
+    # ---------------- reasoning probe / 思考挡位探测 ----------------
+    "reasoning_cache_fresh": (
+        "Reasoning-effort cache is up to date ({count} model(s)); skipping probe",
+        "思考挡位缓存已是最新（{count} 个模型），跳过探测",
+    ),
+    "reasoning_cache_saved": (
+        "Reasoning-effort cache saved to {path} ({count} model(s))",
+        "思考挡位缓存已保存到 {path}（{count} 个模型）",
+    ),
+    "probe_begin": (
+        "Probing reasoning efforts for {count} model(s): {models}",
+        "开始探测 {count} 个模型的思考挡位：{models}",
+    ),
+    "probe_model_ok": (
+        "  {model}: {efforts}",
+        "  {model}：{efforts}",
+    ),
+    "probe_model_unprobeable": (
+        "  {model}: upstream accepted the probe value without validation; no effort info available",
+        "  {model}：上游未校验探测值，无法获知挡位",
+    ),
+    "probe_model_failed": (
+        "  {model}: probe failed ({exc}); will retry on next refresh",
+        "  {model}：探测失败（{exc}），下次刷新时重试",
+    ),
+    "probe_auth_expired": (
+        "Credentials expired while probing reasoning efforts (HTTP {status}); aborting",
+        "探测思考挡位期间凭证失效（HTTP {status}），已中止",
+    ),
+    "probe_finished": (
+        "Reasoning-effort probe finished: {probed} probed, {unknown} unprobeable, {failed} failed",
+        "思考挡位探测完成：成功 {probed} 个，不可探测 {unknown} 个，失败 {failed} 个",
+    ),
+    "probe_models_failed": (
+        "Cannot fetch the model list for the reasoning-effort probe (HTTP {status})",
+        "无法获取模型列表以进行思考挡位探测（HTTP {status}）",
+    ),
+    "probe_task_error": (
+        "Reasoning-effort refresh task crashed: {exc}",
+        "思考挡位刷新任务异常终止：{exc}",
+    ),
+    "probe_wait_timeout": (
+        "Reasoning-effort refresh did not finish within {wait}s; serving the model "
+        "list without full reasoning info (it will appear once the background refresh lands)",
+        "思考挡位刷新未在 {wait} 秒内完成，本次模型列表先不带完整挡位信息返回"
+        "（后台刷新完成后即可看到）",
+    ),
+    "cli_probe_help": (
+        "Force a refresh of the reasoning-effort cache, then exit",
+        "强制刷新思考挡位缓存后退出",
+    ),
     # ---------------- session_store.py ----------------
     "playwright_missing": (
         "playwright is not installed; cannot start browser login.\n"

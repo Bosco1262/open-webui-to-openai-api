@@ -54,6 +54,11 @@ from session_store import (
     perform_browser_login,
     session_exists,
 )
+from reasoning_cache import (
+    PROBE_SENTINEL,
+    ReasoningCache,
+    extract_supported_efforts,
+)
 from upstream import UpstreamClient, UpstreamUnavailable
 
 logger = logging.getLogger("webui-proxy")
@@ -85,6 +90,10 @@ def configure_logging(current: Settings) -> None:
 
 
 upstream = UpstreamClient(settings)
+
+# Per-model reasoning-effort cache (loaded lazily; persisted next to session.json)
+# 逐模型的思考挡位缓存（惰性加载；持久化在 session.json 旁边）
+reasoning_cache = ReasoningCache(settings.reasoning_cache_file)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +150,221 @@ async def _startup_check() -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Reasoning-effort probe & cache
+# 思考挡位探测与缓存
+# --------------------------------------------------------------------------- #
+class _ProbeAuthExpired(Exception):
+    """
+    Raised when the upstream rejects probe requests with 401/403: credentials
+    died mid-probe, the whole refresh must stop instead of hammering a dead
+    session once per model.
+
+    上游对探测请求返回 401/403 时抛出：凭证在探测中途失效，整个刷新应立即
+    停止，而不是对每个模型都拿着死凭证再撞一遍。
+    """
+
+
+async def _probe_model_efforts(session: Any, model_id: str) -> Optional[List[str]]:
+    """
+    Discover which reasoning_effort levels one model accepts.
+
+    Sends a minimal completion request carrying the sentinel "__probe__"; the
+    upstream's Literal validation then rejects it with a 400 whose error text
+    enumerates the accepted values. max_tokens=1 bounds the worst case where an
+    upstream ignores the field entirely and actually generates.
+
+    Return values:
+      - list of efforts: probe succeeded;
+      - []: upstream accepted the sentinel without validating (no info, but
+        remember it so we do not re-probe every startup);
+      - None: probe failed (network/HTTP error, unparseable error) -- retry on
+        the next refresh.
+
+    探测单个模型接受哪些 reasoning_effort 挡位。
+
+    发送一个携带哨兵值 "__probe__" 的最小补全请求；上游的 Literal 校验会以
+    400 拒绝它，错误文本恰好枚举可接受的值。max_tokens=1 兜住最坏情况——
+    上游完全忽略该字段并真的生成时，代价也只有 1 个 token。
+
+    返回值：
+      - 挡位列表：探测成功；
+      - []：上游未校验直接接受（拿不到信息，但记住它，避免每次启动重探）；
+      - None：探测失败（网络/HTTP 错误、错误体解析不出）——下次刷新再试。
+    """
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+        "reasoning_effort": PROBE_SENTINEL,
+    }
+    resp = await upstream.post("chat/completions", session, payload)
+    try:
+        if resp.status_code in AUTH_FAILURE_CODES:
+            raise _ProbeAuthExpired(str(resp.status_code))
+
+        if resp.status_code == 200:
+            # Upstream ignored the sentinel: no validation, no information.
+            # 上游忽略了哨兵值：没有校验，也就没有信息。
+            return []
+
+        # 400/422 are the expected outcome; anything else (404 model vanished,
+        # 5xx) is treated as a transient failure worth retrying later.
+        #
+        # 400/422 才是预期结果；其它状态（404 模型消失、5xx）视为暂时性
+        # 失败，留给下次刷新重试。
+        if resp.status_code not in (400, 422):
+            logger.debug(
+                "probe %s -> HTTP %s: %s", model_id, resp.status_code, resp.text[:200]
+            )
+            return None
+
+        efforts = extract_supported_efforts(resp.text)
+        return efforts or None
+    finally:
+        if not resp.is_closed:
+            await resp.aclose()
+
+
+async def _fetch_model_ids(session: Any) -> Optional[List[str]]:
+    """
+    Fetch the current upstream model id list; None means the list could not be
+    retrieved (the caller should skip this refresh round).
+
+    拉取当前上游的模型 id 列表；None 表示拉取失败（调用方应跳过本轮刷新）。
+    """
+    try:
+        resp = await upstream.get_models(session)
+    except UpstreamUnavailable as exc:
+        logger.warning(lang.t("probe_models_failed", status=exc.status_code))
+        return None
+    try:
+        if resp.status_code != 200:
+            logger.warning(lang.t("probe_models_failed", status=resp.status_code))
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+        ids = [
+            m["id"]
+            for m in (normalize_model(x) for x in extract_model_list(payload))
+            if m
+        ]
+        return ids
+    finally:
+        if not resp.is_closed:
+            await resp.aclose()
+
+
+async def _refresh_reasoning_cache(*, force: bool = False) -> bool:
+    """
+    Reconcile the reasoning cache with the current model list, probe whatever
+    is missing, persist, and report success.
+
+    With force=False (the background path) this is a no-op when the cache
+    already covers every current model -- the "model list unchanged -> serve
+    cache" contract.
+
+    将思考挡位缓存与当前模型列表对齐，探测缺失项，持久化，并汇报结果。
+
+    force=False（后台路径）时，缓存已覆盖全部当前模型则什么都不做——即
+    "模型列表未变 -> 直接用缓存" 的约定。
+    """
+    try:
+        session = load_session(settings)
+    except SessionError as exc:
+        logger.warning("%s", exc)
+        return False
+
+    model_ids = await _fetch_model_ids(session)
+    if model_ids is None:
+        return False
+
+    reasoning_cache.load()
+    to_probe = reasoning_cache.sync_with_models(model_ids, force=force)
+    if not to_probe:
+        logger.info(lang.t("reasoning_cache_fresh", count=len(reasoning_cache)))
+        return True
+
+    logger.info(lang.t("probe_begin", count=len(to_probe), models=", ".join(to_probe)))
+    semaphore = asyncio.Semaphore(settings.reasoning_probe_concurrency)
+    probed = unknown = failed = 0
+
+    async def worker(model_id: str) -> None:
+        nonlocal probed, unknown, failed
+        async with semaphore:
+            try:
+                efforts = await asyncio.wait_for(
+                    _probe_model_efforts(session, model_id),
+                    timeout=settings.reasoning_probe_timeout,
+                )
+            except _ProbeAuthExpired as exc:
+                raise
+            except Exception as exc:  # noqa: BLE001 - per-model isolation
+                failed += 1
+                logger.warning(lang.t("probe_model_failed", model=model_id, exc=exc))
+                return
+            if efforts is None:
+                failed += 1
+                logger.warning(
+                    lang.t("probe_model_failed", model=model_id, exc="no efforts in response")
+                )
+            elif not efforts:
+                unknown += 1
+                reasoning_cache.update(model_id, [])
+                logger.info(lang.t("probe_model_unprobeable", model=model_id))
+            else:
+                probed += 1
+                reasoning_cache.update(model_id, efforts)
+                logger.info(lang.t("probe_model_ok", model=model_id, efforts=", ".join(efforts)))
+
+    try:
+        await asyncio.gather(*(worker(m) for m in to_probe))
+    except _ProbeAuthExpired as exc:
+        logger.error(lang.t("probe_auth_expired", status=exc))
+        # Still save whatever was collected before the credentials died
+        # 凭证失效前收集到的结果仍然落盘
+        reasoning_cache.save()
+        return False
+
+    reasoning_cache.save()
+    logger.info(
+        lang.t("probe_finished", probed=probed, unknown=unknown, failed=failed)
+    )
+    logger.info(
+        lang.t("reasoning_cache_saved", path=settings.reasoning_cache_file, count=len(reasoning_cache))
+    )
+    return True
+
+
+_refresh_task: Optional[asyncio.Task] = None
+
+
+def _spawn_reasoning_refresh() -> Optional[asyncio.Task]:
+    """
+    Launch the cache refresh in the background, at most one instance at a time,
+    and return the running task (either freshly started or already in flight)
+    so callers may optionally wait for it.
+
+    后台启动缓存刷新，同一时刻至多一个实例，并返回运行中的任务
+    （新启动的或已在跑的），调用方可选择性地等待它。
+    """
+    global _refresh_task
+    if _refresh_task is not None and not _refresh_task.done():
+        return _refresh_task
+
+    async def runner() -> None:
+        try:
+            await _refresh_reasoning_cache()
+        except Exception as exc:  # noqa: BLE001 - background task must not die silently
+            logger.warning(lang.t("probe_task_error", exc=exc))
+
+    _refresh_task = asyncio.create_task(runner())
+    return _refresh_task
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(settings)
@@ -163,9 +387,17 @@ async def lifespan(app: FastAPI):
     logger.info(lang.t("banner_style", style=settings.upstream_api_style))
     logger.info("=" * 60)
     await _startup_check()
+    # Background reasoning-effort probe: covers the "first login / cache empty"
+    # case as well as plain startups; never blocks the service from serving.
+    #
+    # 后台思考挡位探测：既覆盖"首次登录 / 缓存为空"，也覆盖普通启动；
+    # 绝不阻塞服务对外提供服务。
+    _spawn_reasoning_refresh()
     try:
         yield
     finally:
+        if _refresh_task is not None and not _refresh_task.done():
+            _refresh_task.cancel()
         await upstream.aclose()
 
 
@@ -546,6 +778,55 @@ async def list_models(_: None = Depends(verify_proxy_key)) -> Response:
             await resp.aclose()
 
     models = [m for m in (normalize_model(x) for x in extract_model_list(payload)) if m]
+
+    # Attach cached reasoning-effort info. Models without cache coverage (fresh
+    # upstream additions, or a startup probe still in flight) are served without
+    # the field right away while a background refresh fills the cache for the
+    # next request.
+    #
+    # 附上缓存中的思考挡位信息。缓存未覆盖的模型（上游新增、或启动探测仍在
+    # 进行中）先不带该字段返回，同时由后台刷新补齐缓存，下次请求即可带上。
+    reasoning_cache.load()
+    missing = False
+    for model in models:
+        info = reasoning_cache.get(model["id"])
+        if info is not None:
+            model["reasoning"] = info
+        else:
+            missing = True
+    if missing:
+        # Prefer serving complete info: give the refresh task a bounded wait
+        # budget. Probes of validation-style upstreams typically land in well
+        # under a second, so the common case is "waited, now complete". On
+        # timeout (or wait disabled with 0) serve what we have -- the background
+        # refresh keeps running and the field shows up on the next request.
+        #
+        # 优先返回完整信息：给刷新任务一个有限等待预算。校验型上游的探测
+        # 通常远小于一秒完成，常见情况是"等到了，信息齐全"。超时（或设 0
+        # 不等待）则先返回现有内容——后台刷新继续跑，字段会在下次请求
+        # 出现。
+        refresh_task = _spawn_reasoning_refresh()
+        if refresh_task is not None and settings.reasoning_probe_wait > 0:
+            try:
+                # shield: on timeout only the *wait* is cancelled, the refresh
+                # task keeps running for later requests.
+                #
+                # shield：超时只取消"等待"，刷新任务本身继续运行。
+                await asyncio.wait_for(
+                    asyncio.shield(refresh_task), timeout=settings.reasoning_probe_wait
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    lang.t("probe_wait_timeout", wait=settings.reasoning_probe_wait)
+                )
+        # Merge again: models probed during the wait are now covered
+        # 再合并一轮：等待期间探测完成的模型现在已有缓存
+        for model in models:
+            if "reasoning" not in model:
+                info = reasoning_cache.get(model["id"])
+                if info is not None:
+                    model["reasoning"] = info
+
     return JSONResponse(content={"object": "list", "data": models})
 
 
@@ -809,6 +1090,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=lang.t("cli_description"))
     parser.add_argument("--login", action="store_true", help=lang.t("cli_login_help"))
     parser.add_argument("--check", action="store_true", help=lang.t("cli_check_help"))
+    parser.add_argument("--probe", action="store_true", help=lang.t("cli_probe_help"))
     parser.add_argument("--host", default=None, help=lang.t("cli_host_help"))
     parser.add_argument("--port", type=int, default=None, help=lang.t("cli_port_help"))
     parser.add_argument(
@@ -840,6 +1122,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.check:
         return asyncio.run(_check_session())
+
+    if args.probe:
+        # Force a full reasoning-effort refresh, synchronously, then exit.
+        # 强制完整刷新一次思考挡位缓存（同步等待），然后退出。
+        if not session_exists(settings):
+            logger.error(lang.t("check_session_missing", path=settings.session_file))
+            return 1
+        try:
+            load_session(settings)
+        except SessionError as exc:
+            logger.error(lang.t("creds_unusable", exc=exc))
+            return 1
+        return 0 if asyncio.run(_refresh_reasoning_cache(force=True)) else 1
 
     if args.login or not session_exists(settings):
         try:

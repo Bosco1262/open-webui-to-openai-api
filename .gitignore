@@ -7,9 +7,9 @@
 session.json
 *.session.json
 
-# Reasoning-effort probe cache (regenerable)
-# 思考挡位探测缓存（可再生）
-reasoning_cache.json
+# Per-model probe cache (regenerable)
+# 逐模型探测缓存（可再生）
+model_probe_cache.json
 
 # Python
 __pycache__/

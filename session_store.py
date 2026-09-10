@@ -157,7 +157,7 @@ def _ci_getter(raw: Dict[str, Any]):
 
     构造一个大小写不敏感的取值函数。
     """
-    lowered = {str(k).lower(): v for k, v in raw.items()}
+    lowered = {str(key).lower(): value for key, value in raw.items()}
 
     def get(key: str) -> Any:
         return lowered.get(key.lower())
@@ -214,19 +214,24 @@ def save_session(settings: Settings, session: Session) -> None:
 # 浏览器登录抓取
 # --------------------------------------------------------------------------- #
 def _normalize_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    return {str(name).lower(): str(value) for name, value in (headers or {}).items()}
 
 
 def _build_cookie_header(cookies: Any) -> str:
+    """
+    Render a Playwright cookie jar (or a ready-made header string) as a Cookie header.
+
+    把 Playwright 的 Cookie Jar（或现成的头字符串）渲染成 Cookie 请求头。
+    """
     if isinstance(cookies, str):
         return cookies
-    items = []
-    for item in cookies or []:
-        name = item.get("name")
-        value = item.get("value")
+    pairs = []
+    for cookie in cookies or []:
+        name = cookie.get("name")
+        value = cookie.get("value")
         if name is not None and value is not None:
-            items.append(f"{name}={value}")
-    return "; ".join(items)
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
 
 
 def is_login_signal(url: str, headers: Dict[str, str], api_prefix: str) -> bool:
@@ -251,7 +256,9 @@ def is_login_signal(url: str, headers: Dict[str, str], api_prefix: str) -> bool:
     if not url.startswith(api_prefix):
         return False
 
-    lowered = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    lowered = {
+        str(name).lower(): str(value) for name, value in (headers or {}).items()
+    }
     authorization = lowered.get("authorization", "").strip()
     cookie = lowered.get("cookie", "").strip()
     if not authorization and not cookie:
@@ -375,8 +382,8 @@ async def perform_browser_login(
             # 页面事件回调不应打断整体流程
             logger.debug(lang.t("capture_error_debug", exc=exc))
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=headless)
         context = await browser.new_context(ignore_https_errors=not settings.upstream_verify_ssl)
         page = await context.new_page()
         page.on("request", on_request)
@@ -470,8 +477,8 @@ async def _enrich_from_browser(page, context, settings: Settings, session: Sessi
         #
         # 只取 Open WebUI 域的 Cookie：浏览器里可能还带着校园网门户等其他
         # 站点的 Cookie，混进上游请求头没有任何好处。
-        jar = await context.cookies(settings.open_webui_base_url)
-        cookie_header = _build_cookie_header(jar)
+        cookies = await context.cookies(settings.open_webui_base_url)
+        cookie_header = _build_cookie_header(cookies)
         if cookie_header:
             session.cookie = cookie_header
     except Exception as exc:

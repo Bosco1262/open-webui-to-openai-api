@@ -108,10 +108,10 @@ class UpstreamClient:
         """
         if self.prefix and not refresh:
             return self.prefix
-        prefix, _status = await self.probe_models(session)
+        prefix, _status = await self.probe_prefix(session)
         return prefix
 
-    async def probe_models(self, session: Session) -> tuple[str, int]:
+    async def probe_prefix(self, session: Session) -> tuple[str, int]:
         """
         Probe for a usable prefix; return (prefix, HTTP status of the probe request).
 
@@ -174,6 +174,46 @@ class UpstreamClient:
         except httpx.RequestError as exc:
             raise UpstreamUnavailable(lang.t("unavailable_connect", url=url, exc=exc)) from exc
 
+    async def get_instance_config(self, session: Session) -> Optional[Dict[str, Any]]:
+        """
+        GET the Open WebUI instance config (`/api/config`).
+
+        That route exists under the legacy prefix only: `/api/v1/config` is not a
+        route, and Open WebUI's SPA answers unknown paths with HTTP 200 and an HTML
+        page, so the usual 404-based prefix fallback cannot be used here.
+
+        Returns None on any failure -- this metadata is a bonus, never a requirement.
+
+        GET Open WebUI 实例配置（`/api/config`）。
+
+        该路由只存在于旧版前缀下：`/api/v1/config` 不是路由，而 Open WebUI 的 SPA
+        会用 HTTP 200 + 一页 HTML 回答未知路径，因此这里不能用基于 404 的前缀回退。
+
+        任何失败都返回 None——这份元信息是附加项，绝不是必需项。
+        """
+        url = self.settings.upstream_url("/api", "config")
+        client = await self.client()
+        try:
+            response = await client.get(url, headers=session.to_headers())
+        except httpx.RequestError as exc:
+            logger.debug(lang.t("instance_meta_failed", exc=exc))
+            return None
+        try:
+            if response.status_code != 200:
+                logger.debug(
+                    lang.t("instance_meta_failed", exc=f"HTTP {response.status_code}")
+                )
+                return None
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.debug(lang.t("instance_meta_failed", exc="response is not JSON"))
+                return None
+            return payload if isinstance(payload, dict) else None
+        finally:
+            if not response.is_closed:
+                await response.aclose()
+
     async def _send_with_prefix_fallback(
         self,
         session: Session,
@@ -196,7 +236,11 @@ class UpstreamClient:
         body / headers 的形态，post() 与 forward() 共用同一套回退策略。
         """
         prefix = await self.detect_prefix(session)
-        candidates = [prefix] + [p for p in self.settings.prefix_candidates() if p != prefix]
+        candidates = [prefix] + [
+            candidate
+            for candidate in self.settings.prefix_candidates()
+            if candidate != prefix
+        ]
         client = await self.client()
 
         last_exc: Optional[Exception] = None
@@ -221,8 +265,8 @@ class UpstreamClient:
 
     async def post(
         self,
-        subpath: str,
         session: Session,
+        subpath: str,
         payload: Dict[str, Any],
         *,
         stream: bool = False,
@@ -234,18 +278,20 @@ class UpstreamClient:
         POST JSON 到上游；若主前缀返回 404（无此路由）则回退到其它候选前缀。
         """
 
-        def build(client: httpx.AsyncClient, url: str) -> httpx.Request:
+        def build_request(client: httpx.AsyncClient, url: str) -> httpx.Request:
             # httpx's post() has no stream parameter; must use build_request + send
             # httpx 的 post() 不支持 stream 参数，必须用 build_request + send
-            return client.build_request("POST", url, headers=session.to_headers(), json=payload)
+            return client.build_request(
+                "POST", url, headers=session.to_headers(), json=payload
+            )
 
-        return await self._send_with_prefix_fallback(session, subpath, build, stream=stream)
+        return await self._send_with_prefix_fallback(session, subpath, build_request, stream=stream)
 
     async def forward(
         self,
+        session: Session,
         method: str,
         subpath: str,
-        session: Session,
         *,
         headers: Optional[Dict[str, str]] = None,
         content: Optional[bytes] = None,
@@ -263,10 +309,10 @@ class UpstreamClient:
         供 /v1/* 兜底透传使用：不构造 JSON 体，原样转发调用方给定的字节与请求头。
         """
 
-        def build(client: httpx.AsyncClient, url: str) -> httpx.Request:
+        def build_request(client: httpx.AsyncClient, url: str) -> httpx.Request:
             return client.build_request(method, url, headers=headers, content=content)
 
-        return await self._send_with_prefix_fallback(session, subpath, build, stream=stream)
+        return await self._send_with_prefix_fallback(session, subpath, build_request, stream=stream)
 
     # ------------------------------------------------------------------ #
     # Utilities
@@ -288,9 +334,9 @@ class UpstreamClient:
         """
         drop = HOP_BY_HOP_HEADERS | SELF_GENERATED_HEADERS
         headers = {
-            k.lower(): v
-            for k, v in resp.headers.items()
-            if k.lower() not in drop
+            name.lower(): value
+            for name, value in resp.headers.items()
+            if name.lower() not in drop
         }
         for key, value in (extra or {}).items():
             headers[key.lower()] = value

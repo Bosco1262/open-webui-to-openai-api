@@ -52,35 +52,35 @@ VALID_STYLES = (STYLE_AUTO, STYLE_V1, STYLE_LEGACY)
 VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "TRACE")
 
 
-def _get_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+def _get_bool(env_var: str, default: bool) -> bool:
+    raw = os.getenv(env_var)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _get_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+def _get_int(env_var: str, default: int) -> int:
+    raw = os.getenv(env_var)
     if raw is None or raw.strip() == "":
         return default
     try:
         return int(raw)
     except ValueError:
-        logger.warning(lang.t("int_invalid", name=name, raw=raw, default=default))
+        logger.warning(lang.t("int_invalid", name=env_var, raw=raw, default=default))
         return default
 
 
-def _get_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw = os.getenv(name)
+def _get_float(env_var: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(env_var)
     if raw is None or raw.strip() == "":
         return default
     try:
         value = float(raw)
     except ValueError:
-        logger.warning(lang.t("float_invalid", name=name, raw=raw, default=default))
+        logger.warning(lang.t("float_invalid", name=env_var, raw=raw, default=default))
         return default
     if value < minimum:
-        logger.warning(lang.t("float_below_min", name=name, raw=raw, minimum=minimum, default=default))
+        logger.warning(lang.t("float_below_min", name=env_var, raw=raw, minimum=minimum, default=default))
         return default
     return value
 
@@ -97,33 +97,33 @@ def _get_log_level(debug: bool) -> str:
     return raw
 
 
-def _get_aliases(name: str) -> Dict[str, str]:
+def _get_aliases(env_var: str) -> Dict[str, str]:
     """
     Parse model aliases, shaped like '{"gpt-4o": "gpt-4o-mini"}'.
 
     解析模型别名，形如 '{"gpt-4o": "gpt-4o-mini"}'。
     """
-    raw = os.getenv(name, "").strip()
+    raw = os.getenv(env_var, "").strip()
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning(lang.t("aliases_not_json", name=name))
+        logger.warning(lang.t("aliases_not_json", name=env_var))
         return {}
     if not isinstance(parsed, dict):
-        logger.warning(lang.t("aliases_not_object", name=name))
+        logger.warning(lang.t("aliases_not_object", name=env_var))
         return {}
-    return {str(k): str(v) for k, v in parsed.items()}
+    return {str(key): str(value) for key, value in parsed.items()}
 
 
-def _get_str_list(name: str) -> List[str]:
+def _get_str_list(env_var: str) -> List[str]:
     """
     Parse a comma-separated list of strings, shaped like 'http://a,http://b'.
 
     解析逗号分隔的字符串列表，形如 'http://a,http://b'。
     """
-    raw = os.getenv(name, "").strip()
+    raw = os.getenv(env_var, "").strip()
     if not raw:
         return []
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -150,12 +150,13 @@ class Settings:
     # ---------- 凭证 ----------
     session_file: Path
 
-    # ---------- Reasoning-effort probe ----------
-    # ---------- 思考挡位探测 ----------
-    reasoning_cache_file: Path
-    reasoning_probe_concurrency: int = 4
-    reasoning_probe_timeout: float = 30.0
-    reasoning_probe_wait: float = 5.0
+    # ---------- Per-model probe (reasoning efforts + capabilities) ----------
+    # ---------- 逐模型探测（思考挡位 + 能力） ----------
+    model_probe_cache_file: Path
+    model_probe_concurrency: int = 4
+    model_probe_timeout: float = 30.0
+    model_probe_wait: float = 5.0
+    expose_instance_meta: bool = True
 
     # ---------- Behavior ----------
     # ---------- 行为 ----------
@@ -198,8 +199,8 @@ def load_settings() -> Settings:
     base_url = os.getenv("OPEN_WEBUI_BASE_URL", "http://localhost:8080").strip().rstrip("/")
     if not base_url:
         raise RuntimeError(lang.t("base_url_empty"))
-    parsed = urlparse(base_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    url = urlparse(base_url)
+    if url.scheme not in ("http", "https") or not url.netloc:
         raise RuntimeError(lang.t("base_url_invalid", url=base_url))
 
     style = os.getenv("UPSTREAM_API_STYLE", STYLE_AUTO).strip().lower()
@@ -228,22 +229,30 @@ def load_settings() -> Settings:
         proxy_port=_get_int("PROXY_PORT", 8000),
         proxy_api_key=os.getenv("PROXY_API_KEY", "").strip(),
         session_file=Path(os.getenv("SESSION_FILE", "session.json")).expanduser(),
-        # Reasoning-effort cache: refreshed only when the model list changes;
-        # concurrency/timeout bound the per-model probe requests.
+        # Per-model probe cache: reused as-is while the engine fingerprint of a
+        # model is unchanged; concurrency/timeout bound the probe requests and
+        # `model_probe_wait` bounds how long /v1/models may block on a probe that
+        # is actually in flight.
         #
-        # 思考挡位缓存：仅在模型列表变化时刷新；并发数/超时约束逐模型的
-        # 探测请求。
-        reasoning_cache_file=Path(
-            os.getenv("REASONING_CACHE_FILE", "reasoning_cache.json")
+        # 逐模型探测缓存：只要模型的引擎指纹不变就直接复用；并发数/超时约束探测
+        # 请求，`model_probe_wait` 约束 /v1/models 在"确有探测在飞行中"时的等待上限。
+        model_probe_cache_file=Path(
+            os.getenv("MODEL_PROBE_CACHE_FILE", "model_probe_cache.json")
         ).expanduser(),
-        reasoning_probe_concurrency=max(1, _get_int("REASONING_PROBE_CONCURRENCY", 4)),
-        reasoning_probe_timeout=_get_float("REASONING_PROBE_TIMEOUT", 30.0, minimum=1.0),
-        # How long /v1/models may block waiting for a missing-models probe to
-        # finish before serving without the reasoning field (0 = never wait).
+        model_probe_concurrency=max(1, _get_int("MODEL_PROBE_CONCURRENCY", 4)),
+        model_probe_timeout=_get_float("MODEL_PROBE_TIMEOUT", 30.0, minimum=1.0),
+        # How long /v1/models may block waiting for an in-flight probe before
+        # serving without the probe fields (0 = never wait).
         #
-        # /v1/models 在返回前最多等待缺失模型的探测完成多久
-        # （0 = 从不等待，直接返回）。
-        reasoning_probe_wait=_get_float("REASONING_PROBE_WAIT", 5.0, minimum=0.0),
+        # /v1/models 在确有探测飞行中时最多等待多久再返回（0 = 从不等待）。
+        model_probe_wait=_get_float("MODEL_PROBE_WAIT", 5.0, minimum=0.0),
+        # Instance-level Open WebUI metadata (feature switches, the default model
+        # metadata template) is exposed in the /v1/models envelope under
+        # "x_open_webui"; turn off for clients that reject unknown envelope keys.
+        #
+        # 实例级 Open WebUI 元信息（功能开关、默认模型元数据模板）以 "x_open_webui"
+        # 放在 /v1/models 信封里；对拒绝未知信封键的客户端可关闭。
+        expose_instance_meta=_get_bool("EXPOSE_INSTANCE_META", True),
         model_aliases=_get_aliases("MODEL_ALIASES"),
         cors_origins=_get_str_list("PROXY_CORS_ORIGINS"),
         debug=debug,

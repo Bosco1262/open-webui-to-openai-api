@@ -16,6 +16,7 @@ behaviors of both upstream versions:
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,19 +34,72 @@ ABORT_MODEL = "abort-model"
 #
 # 推理模型：响应带 reasoning_content 思考内容，用于验证代理对扩展字段无损透传
 REASONING_MODEL = "reasoning-content-model"
-
-# Models whose chat endpoint validates reasoning_effort like vLLM does, plus the
-# accepted levels per model; used to exercise the reasoning-effort probe. Models
-# NOT in this mapping silently accept any reasoning_effort (simulating an
-# upstream that ignores the field), and REASONING_MODEL is deliberately kept
-# out to cover the "unprobeable" branch.
+# Models used to verify that capabilities are established by probing the engine
+# rather than echoed from the upstream's default metadata template:
+#   * one whose engine has no tool-call parser  -> function_calling must be false;
+#   * one that is not multimodal                -> vision must be false.
 #
-# chat 端点像 vLLM 一样校验 reasoning_effort 的模型及其接受的挡位；用于测试
-# 思考挡位探测。不在此映射中的模型会静默接受任意 reasoning_effort（模拟忽略
-# 该字段的上游），REASONING_MODEL 有意留在外面以覆盖"不可探测"分支。
-PROBEABLE_MODELS: Dict[str, list] = {
-    "llama3:latest": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-    "legacy-model": ["none", "low", "medium", "high"],
+# 用于验证"能力靠探测引擎得出、而非照抄上游默认元数据模板"的模型：
+#   * 引擎没带 tool-call parser -> function_calling 必须为 false；
+#   * 非多模态                  -> vision 必须为 false。
+NO_TOOLS_MODEL = "no-tools-model"
+TEXT_ONLY_MODEL = "text-only-model"
+
+# The capability dictionary Open WebUI hands to EVERY model (its "default model
+# metadata" template is merged into each of them). It is deliberately the same for all
+# models here, and deliberately claims things the specific engines do not support --
+# exactly the trap that made the previous implementation advertise vision=true for a
+# text-only engine.
+#
+# Open WebUI 发给**每个**模型的能力字典（它的"默认模型元数据"模板会合并进每个模型）。
+# 这里刻意对所有模型都一样，并刻意声明了具体引擎并不支持的能力——这正是让旧实现
+# 给纯文本引擎广告 vision=true 的陷阱。
+DEFAULT_MODEL_CAPABILITIES = {
+    "file_context": True,
+    "vision": True,
+    "file_upload": True,
+    "web_search": True,
+    "image_generation": True,
+    "code_interpreter": True,
+    "terminal": True,
+    "citations": True,
+    "status_updates": True,
+    "builtin_tools": True,
+    "usage": True,
+}
+
+# Reasoning-effort validation is two-layered upstream, and the proxy has to see both:
+#   * `literal`  -- what the engine's request schema accepts (the sentinel probe
+#                   reveals exactly this list);
+#   * `accepted` -- what the model's own reasoning parser accepts afterwards, which is
+#                   the smaller set that actually matters.
+# A model whose two layers differ is the regression this file exists to catch.
+#
+# 上游的思考挡位校验有两层，代理必须都看到：
+#   * `literal`  —— 引擎请求 schema 接受的挡位（哨兵探测揭示的正是这一份）；
+#   * `accepted` —— 模型自带推理解析器随后真正接受的挡位，即真正重要的那个更小的集合。
+# 两层不一致的模型，正是本文件存在意义所在的回归用例。
+PROBEABLE_MODELS: Dict[str, Dict[str, Any]] = {
+    # Both layers agree: a well-behaved engine.
+    # 两层一致：行为良好的引擎。
+    "llama3:latest": {
+        "literal": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "accepted": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "style": "harmony",
+        "default": None,
+    },
+    # Both layers disagree, and the second layer's error text is itself incomplete
+    # (it never mentions "none", which the parser does accept) -- so advertising the
+    # parsed list instead of the verified one would still be wrong.
+    #
+    # 两层不一致，且第二层的报错文本本身也不完整（它没提 none，而解析器其实接受
+    # none）——因此"照抄解析出的列表"依然是错的，只有逐值实证才对。
+    "legacy-model": {
+        "literal": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "accepted": ["none", "low", "medium", "xhigh"],
+        "style": "qwen",
+        "default": "xhigh",
+    },
 }
 
 MODELS = {
@@ -57,15 +111,99 @@ MODELS = {
             "object": "model",
             "created": 1700000000,
             "owned_by": "ollama",
-            "info": {"meta": {"profile_image_url": "/static/x.png", "description": "should be dropped"}},
+            "info": {
+                "meta": {
+                    "profile_image_url": "/static/x.png",
+                    "description": "should be dropped",
+                    "capabilities": DEFAULT_MODEL_CAPABILITIES,
+                }
+            },
             "params": {"temperature": 0.7},
             "access_grants": [],
         },
         # Legacy upstreams may lack object / created / owned_by
         # 老版本上游可能缺少 object / created / owned_by
-        {"id": "legacy-model", "name": "legacy-model"},
+        {
+            "id": "legacy-model",
+            "name": "legacy-model",
+            "info": {"meta": {"capabilities": DEFAULT_MODEL_CAPABILITIES}},
+        },
+        {
+            "id": REASONING_MODEL,
+            "name": REASONING_MODEL,
+            "object": "model",
+            "created": 1700000001,
+            "owned_by": "ollama",
+            "info": {"meta": {"capabilities": DEFAULT_MODEL_CAPABILITIES}},
+        },
+        {
+            "id": NO_TOOLS_MODEL,
+            "name": NO_TOOLS_MODEL,
+            "object": "model",
+            "created": 1700000002,
+            "owned_by": "vllm",
+            "max_model_len": 8192,
+            "openai": {"owned_by": "vllm", "root": "mock/no-tools", "max_model_len": 8192},
+            "info": {"meta": {"capabilities": DEFAULT_MODEL_CAPABILITIES}},
+        },
+        {
+            "id": TEXT_ONLY_MODEL,
+            "name": TEXT_ONLY_MODEL,
+            "object": "model",
+            "created": 1700000003,
+            "owned_by": "vllm",
+            "max_model_len": 4096,
+            "openai": {"owned_by": "vllm", "root": "mock/text-only", "max_model_len": 4096},
+            "info": {"meta": {"capabilities": DEFAULT_MODEL_CAPABILITIES}},
+        },
     ],
 }
+
+
+def build_literal_error(efforts: list, requested: Any) -> str:
+    """
+    The pydantic/vLLM "outer schema" error the sentinel probe relies on.
+
+    哨兵探测所依赖的 pydantic/vLLM "外层 schema" 报错。
+    """
+    quoted = ", ".join(f"'{effort}'" for effort in efforts[:-1]) + f" or '{efforts[-1]}'"
+    return (
+        "1 validation error:\n"
+        "  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort'), "
+        f"'msg': \"Input should be {quoted}\", "
+        f"'input': {json.dumps(requested)}, "
+        f"'ctx': {{'expected': \"{quoted}\"}}}}"
+    )
+
+
+def build_second_layer_error(rules: Dict[str, Any], requested: str) -> str:
+    """
+    The model-level error of the second validation layer, in one of the two real
+    phrasings captured from a live upstream.
+
+    第二层（模型级）校验的报错，采用从真实上游捕获的两种措辞之一。
+    """
+    accepted = rules["accepted"]
+    default = rules.get("default")
+    if rules.get("style") == "qwen":
+        # Qwen style, and faithfully incomplete: it names the thinking levels but not
+        # "none", even though "none" is accepted.
+        #
+        # Qwen 风格，且忠实地"不完整"：它点名了思考挡位，却没提 none，
+        # 而 none 其实是被接受的。
+        named = [level for level in accepted if level != "none"]
+        listed = []
+        for level in reversed(named):
+            listed.append(f"{level} (default)" if level == default else level)
+        if len(listed) > 1:
+            body = ", ".join(listed[:-1]) + f", and {listed[-1]}"
+        else:
+            body = listed[0]
+        return f"Unexpected reasoning effort {requested}. Supported types are {body}."
+    return (
+        f"reasoning_effort='{requested}' is not supported by Harmony. "
+        f"Supported values are: {', '.join(accepted)}."
+    )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -150,6 +288,30 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, MODELS)
             return
+        if path == "/api/config":
+            # Instance metadata: the proxy reads it for the envelope's x_open_webui
+            # (and deliberately NOT from /api/v1/config, which is not a route here and
+            # would answer with an HTML page).
+            #
+            # 实例元信息：代理读取它用于信封里的 x_open_webui（且刻意不读
+            # /api/v1/config —— 那在这里不是路由，会返回一页 HTML）。
+            if not self._authorized(self.headers):
+                self._send_json(401, {"detail": "Not authenticated"})
+                return
+            self._send_json(
+                200,
+                {
+                    "status": True,
+                    "name": "MockOpenWebUI",
+                    "version": "mock-1.0",
+                    "features": {
+                        "enable_web_search": False,
+                        "enable_code_execution": False,
+                        "enable_code_interpreter": False,
+                    },
+                },
+            )
+            return
         if path == "/health":
             self._send_json(200, {"status": True})
             return
@@ -193,6 +355,24 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"detail": f"Not Found: {path}"})
 
+    @staticmethod
+    def _carries_image(payload: Dict[str, Any]) -> bool:
+        """
+        Whether a chat request contains an image content part.
+
+        聊天请求里是否包含图片内容块。
+        """
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+        return False
+
     def _handle_chat(self, payload: Dict[str, Any], model: Optional[str]) -> None:
         if model == ERROR_MODEL:
             self._send_json(400, {"detail": "Model is not available"})
@@ -201,26 +381,44 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_sse_then_abort()
             return
 
-        # Reasoning-effort probe: reply with a vLLM-style validation error that
-        # enumerates the accepted levels for this model.
+        # Capability probes: this engine was built without a tool-call parser, and
+        # this one is not multimodal -- while the upstream's default metadata template
+        # claims both. Only a probe can tell the truth.
         #
-        # 思考挡位探测：返回 vLLM 风格的校验错误，枚举该模型接受的挡位。
-        if payload.get("reasoning_effort") == "__probe__" and model in PROBEABLE_MODELS:
-            efforts = PROBEABLE_MODELS[model]
-            quoted = ", ".join(f"'{e}'" for e in efforts[:-1]) + f" or '{efforts[-1]}'"
+        # 能力探测：这个引擎没带 tool-call parser，那个不是多模态——而上游的默认元数据
+        # 模板却把两者都声明为支持。只有探测能说出真相。
+        if model == NO_TOOLS_MODEL and (
+            payload.get("tools") or payload.get("tool_choice")
+        ):
             self._send_json(
                 400,
                 {
                     "detail": (
-                        "1 validation error:\n"
-                        "  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort'), "
-                        f"'msg': \"Input should be {quoted}\", "
-                        "'input': '__probe__', "
-                        f"'ctx': {{'expected': \"{quoted}\"}}}}"
+                        '"auto" tool choice requires --enable-auto-tool-choice and '
+                        "--tool-call-parser to be set"
                     )
                 },
             )
             return
+        if model == TEXT_ONLY_MODEL and self._carries_image(payload):
+            self._send_json(400, {"detail": f"{model} is not a multimodal model"})
+            return
+
+        # Reasoning-effort validation, in its two real layers: the request schema
+        # first (which is what the sentinel probe reveals), then the model's own
+        # parser (which is the smaller set that actually matters).
+        #
+        # 思考挡位校验的两个真实层次：先是请求 schema（哨兵探测揭示的那一层），
+        # 再是模型自带解析器（真正重要的那个更小的集合）。
+        rules = PROBEABLE_MODELS.get(model or "")
+        if rules is not None:
+            requested = payload.get("reasoning_effort")
+            if requested is not None and requested not in rules["literal"]:
+                self._send_json(400, {"detail": build_literal_error(rules["literal"], requested)})
+                return
+            if requested is not None and requested not in rules["accepted"]:
+                self._send_json(400, {"detail": build_second_layer_error(rules, requested)})
+                return
 
         if model == REASONING_MODEL:
             # Reasoning model: thinking text uses the DeepSeek de-facto standard
@@ -300,12 +498,37 @@ class _Handler(BaseHTTPRequestHandler):
         )
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """
+    A threading server that does not dump a traceback when a client vanishes.
+
+    The proxy opens and closes many short-lived connections while probing, and the
+    socketserver default handler treats every client-side reset as a server error --
+    which buries the real test output in noise.
+
+    一个不会因客户端消失而倾倒 traceback 的多线程服务器。
+
+    代理探测时会开合大量短连接，socketserver 的默认处理器把每次客户端重置都当成
+    服务端错误——那会把真正的测试输出埋在噪声里。
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(
+            error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)
+        ):
+            return
+        super().handle_error(request, client_address)
+
+
 class MockOpenWebUI:
     # A mock upstream running in its own thread.
     # 在独立线程里跑起来的 mock 上游。
 
     def __init__(self, host: str = "127.0.0.1", port: int = 0):
-        self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._server = _QuietThreadingHTTPServer((host, port), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property

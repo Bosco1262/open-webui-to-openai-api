@@ -12,6 +12,7 @@ Run from the project root:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -25,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import app as proxy  # noqa: E402
 import config as config_module  # noqa: E402
 import lang as lang_module  # noqa: E402
-import reasoning_cache as rcache  # noqa: E402
+import model_probe as mprobe  # noqa: E402
 import session_store as store  # noqa: E402
 
 PASSED: list = []
@@ -162,7 +163,12 @@ def test_model_normalization() -> None:
         }
     )
     check("标准字段保留", full["id"] == "llama3:latest" and full["owned_by"] == "ollama", str(full))
-    check("私有字段被剔除", set(full.keys()) == {"id", "object", "created", "owned_by"}, str(full))
+    check("上游的显示名被透出", full.get("name") == "llama3", str(full))
+    check(
+        "私有字段被剔除",
+        set(full.keys()) == {"id", "name", "object", "created", "owned_by"},
+        str(full),
+    )
 
     legacy = proxy.normalize_model({"id": "old-model"})
     check(
@@ -177,6 +183,7 @@ def test_model_normalization() -> None:
     )
     check("非对象类型返回 None", proxy.normalize_model(12345) is None)
 
+    shared_capabilities = {"vision": True, "web_search": True}
     extended = proxy.normalize_model(
         {
             "id": "GLM-5.2-NVFP4",
@@ -188,14 +195,15 @@ def test_model_normalization() -> None:
                 "created_at": 1779326071,
                 "meta": {
                     "description": "A test model",
-                    "capabilities": {"vision": True, "usage": False, "bad": "x", "builtin_tools": True},
+                    "capabilities": dict(shared_capabilities, usage=False),
                 },
                 "access_grants": [{"principal_id": "*"}],
             },
             "urlIdx": 3,
             "permission": [],
             "openai": {"owned_by": "vllm", "max_model_len": 999},
-        }
+        },
+        shared_capabilities,
     )
     check("created 优先取 info.created_at", extended.get("created") == 1779326071, str(extended))
     check("owned_by 优先取内层引擎归属", extended.get("owned_by") == "vllm", str(extended))
@@ -207,11 +215,32 @@ def test_model_normalization() -> None:
         str(extended),
     )
     check("quantization 从模型名解析", extended.get("quantization") == "NVFP4", str(extended))
+    check("description 透出", extended.get("description") == "A test model", str(extended))
     check(
-        "扩展白名单透出（含派生 function_calling）",
-        extended.get("description") == "A test model"
-        and extended.get("capabilities") == {"vision": True, "usage": False, "builtin_tools": True, "function_calling": True},
+        "偏离实例模板的能力放进 x_open_webui，而不是 capabilities",
+        extended.get("capabilities") is None
+        and extended.get("x_open_webui") == {"capabilities": {"usage": False}},
         str(extended),
+    )
+    matched = proxy.normalize_model(
+        {
+            "id": "in-template",
+            "info": {"meta": {"capabilities": dict(shared_capabilities)}},
+        },
+        shared_capabilities,
+    )
+    check(
+        "与实例模板一致时不重复输出",
+        "x_open_webui" not in matched and "capabilities" not in matched,
+        str(matched),
+    )
+    no_template = proxy.normalize_model(
+        {"id": "no-template", "info": {"meta": {"capabilities": {"vision": True}}}}, None
+    )
+    check(
+        "模板不可用时整份能力作为偏离保留",
+        no_template.get("x_open_webui") == {"capabilities": {"vision": True}},
+        str(no_template),
     )
     check(
         "无量化标识时不输出 quantization",
@@ -224,6 +253,63 @@ def test_model_normalization() -> None:
         and "urlIdx" not in extended
         and "permission" not in extended,
         str(extended),
+    )
+
+
+def test_model_fingerprint() -> None:
+    print("\n--- Engine fingerprint / 引擎指纹 ---")
+    base = {
+        "id": "m",
+        "max_model_len": 8192,
+        "openai": {"root": "org/model", "owned_by": "vllm"},
+        "info": {"base_model_id": None, "updated_at": 100},
+    }
+    fingerprint = proxy._model_fingerprint(base, "m")
+    check("同一模型指纹稳定", proxy._model_fingerprint(dict(base), "m") == fingerprint)
+
+    # The top-level `created` is the vLLM response build time: it changes on every
+    # fetch and must not invalidate the cache.
+    #
+    # 顶层 created 是 vLLM 的响应构建时间：每次拉取都变，绝不能让它作废缓存。
+    check(
+        "顶层 created 不参与指纹",
+        proxy._model_fingerprint(dict(base, created=1), "m") == fingerprint
+        and proxy._model_fingerprint(dict(base, created=2), "m") == fingerprint,
+    )
+    check(
+        "引擎换路径/上下文/配置时指纹变化",
+        proxy._model_fingerprint({**base, "openai": {"root": "other/model"}}, "m") != fingerprint
+        and proxy._model_fingerprint({**base, "max_model_len": 4096}, "m") != fingerprint
+        and proxy._model_fingerprint({**base, "info": {"updated_at": 200}}, "m") != fingerprint,
+    )
+
+
+def test_shared_default_capabilities() -> None:
+    print("\n--- Instance-level default capability template / 实例级默认能力模板 ---")
+    template = {"vision": True, "web_search": True}
+    same = [{"info": {"meta": {"capabilities": dict(template)}}} for _ in range(3)]
+    check(
+        "一致时整体归并为实例级模板",
+        proxy._shared_default_capabilities(same) == template,
+        str(proxy._shared_default_capabilities(same)),
+    )
+    differing = same + [{"info": {"meta": {"capabilities": {"vision": False, "web_search": True}}}}]
+    check(
+        "不一致的键被排除，其余仍归并",
+        proxy._shared_default_capabilities(differing) == {"web_search": True},
+        str(proxy._shared_default_capabilities(differing)),
+    )
+    partially_reported = same + [
+        {"info": {"meta": {"capabilities": {"vision": True, "web_search": True, "usage": True}}}}
+    ]
+    check(
+        "只有部分模型上报的键不算模板",
+        proxy._shared_default_capabilities(partially_reported) == template,
+        str(proxy._shared_default_capabilities(partially_reported)),
+    )
+    check(
+        "没有模型上报时返回 None",
+        proxy._shared_default_capabilities([{"id": "no-info"}, {"id": "also-none"}]) is None,
     )
 
 
@@ -263,6 +349,64 @@ def test_config() -> None:
             "拼接上游 URL",
             settings.upstream_url("/api/v1", "chat/completions")
             == "https://webui.example.com/api/v1/chat/completions",
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+
+def test_probe_settings() -> None:
+    print("\n--- Probe settings / 探测配置 ---")
+    env_backup = dict(os.environ)
+    try:
+        for name in (
+            "MODEL_PROBE_CACHE_FILE",
+            "MODEL_PROBE_CONCURRENCY",
+            "MODEL_PROBE_TIMEOUT",
+            "MODEL_PROBE_WAIT",
+            "EXPOSE_INSTANCE_META",
+        ):
+            os.environ.pop(name, None)
+
+        settings = config_module.load_settings()
+        check(
+            "默认缓存文件名与探测参数",
+            settings.model_probe_cache_file.name == "model_probe_cache.json"
+            and settings.model_probe_concurrency == 4
+            and settings.model_probe_timeout == 30.0
+            and settings.model_probe_wait == 5.0,
+            f"{settings.model_probe_cache_file} {settings.model_probe_concurrency} "
+            f"{settings.model_probe_timeout} {settings.model_probe_wait}",
+        )
+
+        os.environ["MODEL_PROBE_CACHE_FILE"] = "custom-cache.json"
+        os.environ["MODEL_PROBE_CONCURRENCY"] = "2"
+        os.environ["MODEL_PROBE_WAIT"] = "0"
+        settings = config_module.load_settings()
+        check(
+            "环境变量生效",
+            settings.model_probe_cache_file.name == "custom-cache.json"
+            and settings.model_probe_concurrency == 2
+            and settings.model_probe_wait == 0.0,
+            f"{settings.model_probe_cache_file} {settings.model_probe_concurrency} {settings.model_probe_wait}",
+        )
+
+        check("实例元信息默认开启", settings.expose_instance_meta is True)
+        os.environ["EXPOSE_INSTANCE_META"] = "false"
+        check("实例元信息可关闭", config_module.load_settings().expose_instance_meta is False)
+
+        # The old REASONING_* names are gone: setting one must change nothing.
+        # 旧的 REASONING_* 名字已彻底移除：设置它们不应产生任何影响。
+        os.environ.pop("MODEL_PROBE_CACHE_FILE", None)
+        os.environ.pop("MODEL_PROBE_WAIT", None)
+        os.environ["REASONING_CACHE_FILE"] = "should-be-ignored.json"
+        os.environ["REASONING_PROBE_WAIT"] = "99"
+        settings = config_module.load_settings()
+        check(
+            "旧的 REASONING_* 变量不再被读取",
+            settings.model_probe_cache_file.name == "model_probe_cache.json"
+            and settings.model_probe_wait == 5.0,
+            f"{settings.model_probe_cache_file} {settings.model_probe_wait}",
         )
     finally:
         os.environ.clear()
@@ -363,17 +507,17 @@ def test_language_detection() -> None:
         lang_module.configure(lang_module.detect_system_language())
 
 
-def _vllm_probe_error(efforts: list) -> str:
+def _literal_error(efforts: list) -> str:
     """
-    Rebuild the vLLM-style validation error captured from a real upstream
+    Rebuild the vLLM-style outer-schema error captured from a real upstream
     (as JSON-wrapped by Open WebUI), for a given accepted-efforts list.
 
-    按给定挡位集合重建从真实上游捕获的 vLLM 风格校验错误
+    按给定挡位集合重建从真实上游捕获的 vLLM 风格外层 schema 报错
     （含 Open WebUI 的 JSON 包裹层）。
     """
     import json
 
-    quoted = ", ".join(f"'{e}'" for e in efforts[:-1]) + f" or '{efforts[-1]}'"
+    quoted = ", ".join(f"'{effort}'" for effort in efforts[:-1]) + f" or '{efforts[-1]}'"
     detail = (
         "1 validation error:\n"
         "  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort'), "
@@ -384,101 +528,312 @@ def _vllm_probe_error(efforts: list) -> str:
     return json.dumps({"detail": detail})
 
 
-def test_reasoning_effort_parsing() -> None:
-    print("\n--- Reasoning-effort error parsing / 思考挡位报错解析 ---")
-    full = _vllm_probe_error(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_effort_candidate_parsing() -> None:
+    print("\n--- Effort candidate parsing (all real phrasings) / 挡位候选解析（全部真实措辞）---")
+    full = _literal_error(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
     check(
-        "解析 7 挡位的真实报错",
-        rcache.extract_supported_efforts(full)
+        "外层 schema：7 挡位",
+        mprobe.extract_effort_candidates(full)
         == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
         full[:200],
     )
-    partial = _vllm_probe_error(["none", "low", "medium", "high"])
+    partial = _literal_error(["none", "low", "medium", "high"])
     check(
-        "解析 4 挡位的真实报错",
-        rcache.extract_supported_efforts(partial) == ["none", "low", "medium", "high"],
+        "外层 schema：4 挡位",
+        mprobe.extract_effort_candidates(partial) == ["none", "low", "medium", "high"],
         partial[:200],
     )
-    check("非 reasoning_effort 的报错不解析", rcache.extract_supported_efforts(
-        "1 validation error:\n  {'type': 'literal_error', 'loc': ('body', 'stop'), "
-        "'msg': \"Input should be 'stop' or 'length'\", 'input': 'x'}"
-    ) == [])
+
+    import json
+
+    harmony = json.dumps(
+        {
+            "detail": "reasoning_effort='max' is not supported by Harmony. "
+            "Supported values are: high, medium, low."
+        }
+    )
+    check(
+        "第二层 Harmony 措辞（旧实现完全读不懂）",
+        mprobe.extract_effort_candidates(harmony) == ["low", "medium", "high"],
+        harmony,
+    )
+    harmony_none = json.dumps({"detail": "Harmony does not support reasoning_effort='none'"})
+    check(
+        "第二层只否定一个值时不下结论",
+        mprobe.extract_effort_candidates(harmony_none) == [],
+        harmony_none,
+    )
+    qwen = json.dumps(
+        {"detail": "Unexpected reasoning effort max. Supported types are xhigh (default), medium, and low."}
+    )
+    check(
+        "第二层 Qwen 措辞（空格而非下划线）",
+        mprobe.extract_effort_candidates(qwen) == ["low", "medium", "xhigh"],
+        qwen,
+    )
+    check("从 Qwen 措辞里提取默认挡位", mprobe.extract_default_effort(qwen) == "xhigh", qwen)
+    check(
+        "没有 (default) 标注时不猜默认值",
+        mprobe.extract_default_effort(harmony) is None,
+        harmony,
+    )
+    check(
+        "非 reasoning_effort 的报错不解析",
+        mprobe.extract_effort_candidates(
+            "1 validation error:\n  {'type': 'literal_error', 'loc': ('body', 'stop'), "
+            "'msg': \"Input should be 'stop' or 'length'\", 'input': 'x'}"
+        )
+        == [],
+    )
     check(
         "同构但值非挡位的报错不解析",
-        rcache.extract_supported_efforts(
+        mprobe.extract_effort_candidates(
             "loc: ('body', 'reasoning_effort'), msg: \"Input should be 'left' or 'right'\""
-        ) == [],
+        )
+        == [],
     )
-    check("空文本返回空", rcache.extract_supported_efforts("") == [])
-    check("普通 500 文本返回空", rcache.extract_supported_efforts("Internal Server Error") == [])
+    check("空文本返回空", mprobe.extract_effort_candidates("") == [])
+    check("普通 500 文本返回空", mprobe.extract_effort_candidates("Internal Server Error") == [])
+    check(
+        "线上 400 是否与挡位有关",
+        mprobe.looks_like_effort_error(qwen)
+        and mprobe.looks_like_effort_error(harmony_none)
+        and not mprobe.looks_like_effort_error("Model is not available"),
+    )
+
+
+def test_parameter_attribution() -> None:
+    print("\n--- Request-parameter attribution / 请求参数归因 ---")
+    check(
+        "pydantic loc 精确归因",
+        mprobe.parameter_of_error(
+            "1 validation error:\n  {'type': 'literal_error', 'loc': ('body', 'reasoning_effort')}"
+        )
+        == "reasoning_effort",
+    )
+    check(
+        "无 loc 时按关键词归因（vLLM 工具报错）",
+        mprobe.parameter_of_error(
+            '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+        )
+        in ("tools", "tool_choice"),
+    )
+    check(
+        "无法归因时返回 None",
+        mprobe.parameter_of_error("Internal Server Error") is None,
+    )
+
+
+def test_probe_payloads() -> None:
+    print("\n--- Probe payloads / 探测载荷 ---")
+    effort = mprobe.effort_payload("m", "high")
+    check(
+        "挡位载荷最小且只带一个值",
+        effort["model"] == "m"
+        and effort["reasoning_effort"] == "high"
+        and effort["max_tokens"] == 1
+        and effort["stream"] is False,
+        str(effort),
+    )
+    check("基线载荷不带 reasoning_effort", "reasoning_effort" not in mprobe.baseline_payload("m"))
+    merged = mprobe.parameter_payload("m", ["tools", "tool_choice", "response_format"])
+    check(
+        "参数合并请求同时携带三项",
+        merged.get("tools") and merged.get("tool_choice") == "auto"
+        and (merged.get("response_format") or {}).get("type") == "json_schema",
+        str(merged)[:200],
+    )
+    vision = mprobe.vision_payload("m")
+    check(
+        "视觉载荷是图片内容块",
+        any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in vision["messages"][0]["content"]
+        ),
+        str(vision)[:200],
+    )
+
+    import json
+
+    check(
+        "从响应体判断思考内容：有",
+        mprobe.response_has_reasoning(
+            json.dumps({"choices": [{"message": {"content": None, "reasoning": "We"}}]})
+        )
+        is True,
+    )
+    check(
+        "从响应体判断思考内容：无",
+        mprobe.response_has_reasoning(
+            json.dumps({"choices": [{"message": {"content": "P", "reasoning": None}}]})
+        )
+        is False,
+    )
+    check(
+        "从响应体判断思考内容：看不出来时为 None",
+        mprobe.response_has_reasoning(
+            json.dumps({"choices": [{"message": {"content": None, "reasoning": None}}]})
+        )
+        is None
+        and mprobe.response_has_reasoning("<html>") is None,
+    )
 
 
 def test_reasoning_info_derivation() -> None:
     print("\n--- Reasoning info derivation / 思考挡位信息推导 ---")
-    info = rcache.build_reasoning_info(["high", "none", "medium", "low", "minimal", "xhigh", "max"])
+    info = mprobe.build_reasoning_info(
+        ["high", "none", "medium", "low", "minimal", "xhigh", "max"], "xhigh", True
+    )
     check(
         "supported_efforts 按规范顺序排序",
         info["supported_efforts"] == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
         str(info),
     )
-    check("含 medium 时默认 medium", info["default_effort"] == "medium", str(info))
+    check("默认挡位来自引擎声明", info["default_effort"] == "xhigh", str(info))
     check("含 none 时非强制", info["mandatory"] is False, str(info))
-    check("default_enabled 恒为 True", info["default_enabled"] is True, str(info))
+    check("default_enabled 如实透出", info["default_enabled"] is True, str(info))
 
-    no_none = rcache.build_reasoning_info(["high", "medium", "low", "minimal"])
-    check("无 none 时判定为强制思考", no_none["mandatory"] is True, str(no_none))
-    check("无 none 时默认 medium", no_none["default_effort"] == "medium", str(no_none))
-
-    no_medium = rcache.build_reasoning_info(["none", "low", "high"])
+    unverified = mprobe.build_reasoning_info(["low", "medium", "high"])
     check(
-        "无 medium 时取中位数挡位",
-        no_medium["default_effort"] == "low",
-        str(no_medium),
+        "引擎未声明默认值时不输出该字段",
+        "default_effort" not in unverified and "default_enabled" not in unverified,
+        str(unverified),
     )
-    check("未知挡位排在末尾且透传", rcache.build_reasoning_info(
-        ["turbo", "low", "none"]
-    )["supported_efforts"] == ["none", "low", "turbo"])
-    check("空挡位返回 None", rcache.build_reasoning_info([]) is None)
+    check("无 none 时判定为强制思考", unverified["mandatory"] is True, str(unverified))
+    check("空挡位返回 None", mprobe.build_reasoning_info([]) is None)
+    check(
+        "未知挡位排在末尾且透传",
+        mprobe.build_reasoning_info(["turbo", "low", "none"])["supported_efforts"]
+        == ["none", "low", "turbo"],
+    )
+    check("模态由视觉结论推导", mprobe.build_architecture(False) == {
+        "modality": "text->text",
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+    })
+    check("视觉未知时不输出模态", mprobe.build_architecture(None) is None)
+    check(
+        "思考能力：接受非关闭挡位即具备",
+        mprobe.derive_reasoning_capability(["none", "low"], None) is True
+        and mprobe.derive_reasoning_capability(["none"], None) is False,
+    )
+    check(
+        "思考能力：挡位未知时看默认行为",
+        mprobe.derive_reasoning_capability(None, True) is True
+        and mprobe.derive_reasoning_capability(None, None) is None,
+    )
 
 
-def test_reasoning_cache_store() -> None:
-    print("\n--- Reasoning cache persistence / 思考挡位缓存 ---")
+def test_probe_cache_store() -> None:
+    print("\n--- Probe cache (v2) persistence / 探测缓存（v2）持久化 ---")
     tmp = Path(tempfile.mkdtemp())
-    cache_file = tmp / "reasoning_cache.json"
-    cache = rcache.ReasoningCache(cache_file)
+    cache_file = tmp / "model_probe_cache.json"
+    cache = mprobe.ModelProbeCache(cache_file)
 
     check("初始无条目", len(cache) == 0)
-    missing = cache.sync_with_models(["a", "b"])
+    missing = cache.sync_with_models([("a", "fp-a"), ("b", "fp-b")])
     check("未缓存的模型需要探测", missing == ["a", "b"], str(missing))
 
-    cache.update("a", ["none", "low", "medium", "high"])
-    cache.update("b", [])  # probed but unprobeable
+    cache.record_result(
+        "a",
+        mprobe.ModelProbe(
+            fingerprint="fp-a",
+            probed_at=1.0,
+            status=mprobe.STATUS_OK,
+            supported_efforts=["none", "low"],
+            efforts_verified=True,
+            default_effort="low",
+            default_enabled=True,
+            capabilities={"vision": True, "function_calling": False, "reasoning": True},
+            supported_parameters=["temperature", "tools"],
+        ),
+    )
+    cache.record_result(
+        "b", mprobe.ModelProbe(fingerprint="fp-b", status=mprobe.STATUS_UNPROBEABLE)
+    )
     cache.save()
     check("缓存文件已生成", cache_file.exists())
 
-    # Reload from disk in a fresh instance
-    fresh = rcache.ReasoningCache(cache_file)
+    fresh = mprobe.ModelProbeCache(cache_file)
     fresh.load()
     check("重新加载后条目数一致", len(fresh) == 2)
-    info = fresh.get("a")
+    presented = fresh.present("a") or {}
     check(
         "重新加载后挡位完整",
-        info is not None and info["supported_efforts"] == ["none", "low", "medium", "high"],
-        str(info),
+        presented.get("reasoning", {}).get("supported_efforts") == ["none", "low"],
+        str(presented),
     )
-    check("不可探测模型不输出 reasoning 字段", fresh.get("b") is None)
-    check("未探测模型返回 None", fresh.get("c") is None)
+    check(
+        "能力与参数一并持久化",
+        presented.get("capabilities") == {"vision": True, "function_calling": False, "reasoning": True}
+        and presented.get("supported_parameters") == ["temperature", "tools"],
+        str(presented),
+    )
+    check(
+        "模态由能力推导",
+        presented.get("architecture", {}).get("modality") == "text+image->text",
+        str(presented),
+    )
+    check(
+        "不可探测的模型仍能给出能力，但不给 reasoning",
+        (fresh.present("b") or {}).get("reasoning") is None,
+        str(fresh.present("b")),
+    )
+    check("未探测模型返回 None", fresh.present("c") is None)
 
-    missing = fresh.sync_with_models(["a", "c"])
-    check("模型消失后条目被清除且新增模型待探", missing == ["c"] and len(fresh) == 1, str(missing))
-    forced = fresh.sync_with_models(["a"], force=True)
-    check("force 时全部模型重探", forced == ["a"], str(forced))
+    check("结论性条目在指纹不变时不再探测", not fresh.needs_probe("a", "fp-a"))
+    check("引擎指纹变化即需重探", fresh.needs_probe("a", "fp-a2"))
+    check("不可探测条目不会被反复重探", not fresh.needs_probe("b", "fp-b"))
+    check("未知模型需要探测", fresh.needs_probe("c", "fp-c"))
 
-    # Corrupt cache file must not crash, just start empty
+    # Negative cache + backoff: a failed probe must not be retried immediately.
+    # 负缓存 + 退避：失败的探测不得立刻重试。
+    fresh.record_failure("c", "fp-c", "boom")
+    check("失败后进入退避", not fresh.needs_probe("c", "fp-c"))
+    check(
+        "退避到期后重试",
+        fresh.needs_probe("c", "fp-c", now=time.time() + mprobe.BACKOFF_MAX_SECONDS + 1),
+    )
+    check(
+        "退避随失败次数增长且有上限",
+        mprobe.backoff_seconds(1) < mprobe.backoff_seconds(3)
+        and mprobe.backoff_seconds(50) == mprobe.BACKOFF_MAX_SECONDS,
+    )
+
+    # A failed re-probe must not throw away facts established earlier.
+    # 失败的重探不得丢掉此前已确立的事实。
+    fresh.record_failure("a", "fp-a", "boom")
+    check(
+        "重探失败时保留已有结论",
+        (fresh.present("a") or {}).get("reasoning", {}).get("supported_efforts") == ["none", "low"],
+        str(fresh.present("a")),
+    )
+
+    # A live 400 that names one level disproves it.
+    # 线上 400 点名某个挡位即证伪它。
+    check("证伪挡位返回 True", fresh.invalidate_effort("a", "low"))
+    check("被证伪的挡位消失且可立即重探", "low" not in (fresh.present("a") or {})["reasoning"]["supported_efforts"]
+          and fresh.needs_probe("a", "fp-a"))
+    check("未被声明的挡位无需处理", not fresh.invalidate_effort("a", "max"))
+
+    missing = fresh.sync_with_models([("a", "fp-a")])
+    check("模型消失后条目被清除", len(fresh) == 1 and missing == ["a"], str(missing))
+    check("force 时全部模型重探", fresh.sync_with_models([("a", "fp-a")], force=True) == ["a"])
+
+    # Corrupt and version-1 files must not crash, just start empty.
+    # 损坏与旧版本文件不得崩溃，只是从空缓存开始。
     cache_file.write_text("{ not json", encoding="utf-8")
-    broken = rcache.ReasoningCache(cache_file)
+    broken = mprobe.ModelProbeCache(cache_file)
     broken.load()
     check("损坏的缓存文件不致崩溃", len(broken) == 0)
+
+    cache_file.write_text(
+        json.dumps({"version": 1, "models": {"a": {"supported_efforts": ["none"]}}}),
+        encoding="utf-8",
+    )
+    old = mprobe.ModelProbeCache(cache_file)
+    old.load()
+    check("旧版本缓存被忽略并重探", len(old) == 0 and old.sync_with_models([("a", "fp")]) == ["a"])
 
 
 if __name__ == "__main__":
@@ -486,14 +841,19 @@ if __name__ == "__main__":
     test_session_file()
     test_login_signal()
     test_model_normalization()
+    test_model_fingerprint()
+    test_shared_default_capabilities()
     test_model_list_extraction()
     test_config()
+    test_probe_settings()
     test_error_shape()
     test_credentials_are_valid()
     test_language_detection()
-    test_reasoning_effort_parsing()
+    test_effort_candidate_parsing()
+    test_parameter_attribution()
+    test_probe_payloads()
     test_reasoning_info_derivation()
-    test_reasoning_cache_store()
+    test_probe_cache_store()
 
     total = len(PASSED) + len(FAILED)
     print("\n" + "=" * 60)

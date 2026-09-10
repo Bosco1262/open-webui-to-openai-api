@@ -30,11 +30,12 @@ Key points:
 
 - **Credential swapping**: externally it presents your custom `PROXY_API_KEY`, while internally it swaps in the browser-captured `Authorization` / `Cookie` — the upstream never sees your proxy key.
 - **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup, and automatically falls back to the other prefix when a request returns 404 (route not found).
-- **Response normalization**: `/v1/models` collapses upstream model objects into the standard `{id, object, created, owned_by}`, plus a whitelist of generic-template fields: `max_context_length` / `context_length` (with `max_model_len` kept as a compatibility alias), `quantization` (parsed from the model id, e.g. `NVFP4`), `capabilities` (with a derived `function_calling` flag) and `description`. Private fields (`user_id`, `access_grants`, `permission`, `urlIdx`, ...) are never exposed.
+- **Response normalization**: `/v1/models` collapses upstream model objects into the standard `{id, object, created, owned_by}`, plus a whitelist of useful extras: `name`, `description`, `max_context_length` / `context_length` (with `max_model_len` kept as a compatibility alias) and `quantization` (parsed from the model id, e.g. `NVFP4`). Private fields (`user_id`, `access_grants`, `permission`, `urlIdx`, ...) are never exposed.
+- **Probed, not echoed**: `capabilities`, `architecture`, `supported_parameters` and `reasoning` are established by asking the engine (`/v1/models`), never copied from Open WebUI's metadata — see [Per-model probe](#per-model-probe-reasoning-efforts--capabilities). The deployment's own feature switches live in the envelope's `x_open_webui` instead, where they cannot be mistaken for model abilities.
 
 ## Features
 
-- **OpenAI compatible**: `/v1/models`, `/v1/chat/completions` (including streaming SSE), `/v1/embeddings`, plus a catch-all passthrough for unimplemented `/v1/*` paths (with prefix fallback as well).
+- **OpenAI compatible**: `/v1/models`, `/v1/models/{id}`, `/v1/chat/completions` (including streaming SSE), `/v1/embeddings`, plus a catch-all passthrough for unimplemented `/v1/*` paths (with prefix fallback as well).
 - **Automatic upstream version adaptation**: `auto` / `v1` / `legacy` upstream API styles, with startup probing + per-request fallback.
 - **Robust streaming forwarding**: when the client disconnects, the upstream connection is closed proactively instead of hanging until timeout; hop-by-hop response headers are stripped correctly.
 - **OpenAI-style error bodies**: returns `{"error": {"message", "type", "code"}}` instead of FastAPI's default `{"detail": ...}`, so clients can show the error reason properly.
@@ -49,6 +50,7 @@ Key points:
 .
 ├── app.py                  # FastAPI routes, OpenAI compatibility layer, CLI entry
 ├── config.py               # All configuration items (env vars / .env)
+├── model_probe.py          # Per-model probe: error parsing, probe payloads, cache
 ├── session_store.py        # Credential load/save + Playwright browser login capture
 ├── upstream.py             # Upstream forwarding: connection pool, prefix probing, streaming
 ├── requirements.txt        # Minimal dependencies to run the service
@@ -111,7 +113,7 @@ Common commands:
 python app.py              # Start the service (logs in first if needed)
 python app.py --login      # Force re-login and refresh credentials
 python app.py --check      # Only validate credentials and upstream connectivity, print a summary, then exit
-python app.py --probe      # Force a re-probe of every model's reasoning levels and refresh the cache
+python app.py --probe      # Force a full re-probe of every model (efforts + capabilities) and refresh the cache
 python app.py --port 9000  # Temporarily override the listen port
 ```
 
@@ -186,12 +188,15 @@ for await (const part of stream) {
 | ---- | ---------------------- | -- | ---------------------------------------------------------------- |
 | GET  | `/`                    | No* | Service info and registered endpoints; the upstream address is returned only with a valid key |
 | GET  | `/healthz`             | No* | Health check always 200; upstream address and probed prefix returned only with a valid key |
-| GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure, with reasoning-effort info attached |
+| GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure, with probed capabilities / parameters / reasoning attached. The envelope also carries `x_open_webui` with the deployment's own metadata |
+| GET  | `/v1/models/{id}`      | Yes | Retrieve one model (`id` may contain slashes); 404 with an OpenAI-style error body when unknown |
 | POST | `/v1/chat/completions` | Yes | Chat completions, supports `stream: true`                         |
 | POST | `/v1/embeddings`       | Yes | Embeddings (upstream must support them)                           |
 | ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path                   |
 
 Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`. If `PROXY_API_KEY` is left empty, no auth is enforced.
+
+Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint does (it has no pagination either; only Anthropic's and Gemini's differently-shaped APIs implement it).
 
 \* `/` and `/healthz` remain unauthenticated (probe/readiness-check friendly), but the `upstream` / `upstream_prefix` fields in the response are only returned when the request carries a valid key (or auth is disabled), to avoid leaking the upstream intranet domain on public deployments.
 
@@ -210,10 +215,11 @@ Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`. If `PROX
 | `REQUEST_TIMEOUT`     | `300`                   | Total upstream request timeout (seconds)                                                             |
 | `CONNECT_TIMEOUT`     | `10`                    | Upstream connect timeout (seconds)                                                                   |
 | `SESSION_FILE`        | `session.json`          | Credential file path                                                                                 |
-| `REASONING_CACHE_FILE` | `reasoning_cache.json` | Reasoning-effort cache file path                                                                     |
-| `REASONING_PROBE_CONCURRENCY` | `4`             | Concurrency of the reasoning-effort probe                                                            |
-| `REASONING_PROBE_TIMEOUT`     | `30`            | Per-model probe timeout (seconds)                                                                   |
-| `REASONING_PROBE_WAIT`        | `5`             | Max seconds `/v1/models` waits for a missing-model probe before answering; `0` = answer immediately |
+| `MODEL_PROBE_CACHE_FILE` | `model_probe_cache.json` | Per-model probe cache path                                                                  |
+| `MODEL_PROBE_CONCURRENCY` | `4`             | Concurrency of the probe requests                                                                    |
+| `MODEL_PROBE_TIMEOUT`     | `30`            | Per-model probe timeout (seconds)                                                                    |
+| `MODEL_PROBE_WAIT`        | `5`             | Max seconds `/v1/models` waits for a probe that is *in flight*; `0` = never wait                     |
+| `EXPOSE_INSTANCE_META`    | `true`          | Whether the `/v1/models` envelope carries `x_open_webui` (turn off for strict clients)               |
 | `MODEL_ALIASES`       | empty                   | JSON object, model name mapping                                                                      |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`; invalid values fall back to `INFO`     |
 | `DEBUG`               | `false`                 | When `true`, equivalent to `LOG_LEVEL=DEBUG`                                                          |
@@ -221,36 +227,123 @@ Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`. If `PROX
 | `LOGIN_QUIET_PERIOD`  | `6`                     | Seconds to keep observing after credentials are captured                                             |
 | `LOGIN_HEADLESS`      | `false`                 | Whether to launch the browser headless                                                               |
 
-## Reasoning-effort probing (reasoning_effort)
+## Per-model probe (reasoning efforts & capabilities)
 
-`/v1/models` attaches a `reasoning` object to each model declaring the reasoning levels it supports:
+`/v1/models` attaches four probed fields to each model:
 
 ```json
 {
-  "id": "GLM-5.3-Flash",
+  "id": "Qwen3.8-27B",
   "object": "model",
-  "...": "...",
+  "created": 1787109489,
+  "owned_by": "vllm",
+  "name": "Qwen3.8-27B",
+  "max_model_len": 262144,
+  "max_context_length": 262144,
+  "context_length": 262144,
+  "architecture": {
+    "modality": "text->text",
+    "input_modalities": ["text"],
+    "output_modalities": ["text"]
+  },
+  "supported_parameters": ["reasoning_effort", "response_format", "temperature", "tools", "..."],
+  "capabilities": {
+    "vision": false,
+    "function_calling": true,
+    "reasoning": true,
+    "structured_outputs": true
+  },
   "reasoning": {
-    "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-    "default_effort": "medium",
-    "default_enabled": true,
-    "mandatory": false
+    "supported_efforts": ["none", "low", "medium", "xhigh"],
+    "mandatory": false,
+    "default_effort": "xhigh",
+    "default_enabled": true
   }
 }
 ```
 
-**How it works**: the upstream (vLLM et al.) validates `reasoning_effort` as a Literal enum. The proxy sends each model a minimal completion request carrying the sentinel `"__probe__"` (`max_tokens=1`); the validation fails with a 400 whose error text conveniently enumerates every accepted level (`Input should be 'none', 'low', 'medium' or 'high'`). Validation happens before generation, so **a probe costs zero tokens**.
+### Why probing is the only honest source
 
-**Caching**: levels are model-specific, so results are persisted to `reasoning_cache.json`. On every startup the cache is reused as-is as long as the model list is unchanged (the log shows "skipping probe"); when models are added or removed, only the new ones get probed. If `/v1/models` notices a model missing from the cache at runtime, it triggers a background refresh and by default waits up to 5 seconds (`REASONING_PROBE_WAIT`) for the probe to finish before answering -- probes typically complete in well under a second, so the first request usually gets full info; on timeout it answers without the field, which appears on the next request.
+Open WebUI reports `info.meta.capabilities` for every model, but that block is its
+**default model metadata template merged into each model** — the keys are identical
+across models and unrelated to what a given engine can do. On a real deployment every
+model claimed `vision: true` while one of them answered an image with HTTP 400
+`"... is not a multimodal model"`, and claimed `web_search: true` while the same
+instance reported `enable_web_search: false` in `/api/config`. The proxy therefore
+establishes capabilities by **asking the engine**, and publishes the upstream template
+once, as an instance fact, under the envelope's `x_open_webui`:
 
-**Derivation rules** (the probe only reveals the accepted set; the rest is heuristic):
+```json
+{
+  "object": "list",
+  "data": [ ... ],
+  "x_open_webui": {
+    "name": "GENAI Chat (Open WebUI)",
+    "version": "0.9.2",
+    "features": { "enable_web_search": false, "..." : "..." },
+    "default_model_capabilities": { "vision": true, "web_search": true, "..." : "..." }
+  }
+}
+```
 
-- `supported_efforts`: exactly what the upstream validation accepts, in canonical `none → max` order;
-- `default_effort`: `medium` when supported, otherwise the median level;
-- `mandatory`: `true` when `none` is absent, i.e. thinking cannot be turned off;
-- `default_enabled`: always `true` (the field is accepted, so reasoning is on by default).
+`default_model_capabilities` holds the keys **every** reporting model agrees on; a key
+the upstream does not report uniformly (a deployment had one model without `usage`)
+is left out of the template, and the models that do report it carry their own value in
+that model's `x_open_webui.capabilities`. `/v1/models` stays this shape whether or not
+the template exists, and `EXPOSE_INSTANCE_META=false` removes `x_open_webui` entirely.
 
-Force a full re-probe with `python app.py --probe` (useful after an upstream redeploy that keeps model names but changes levels).
+### How one probe works
+
+Every step is a real request with `max_tokens=1`, so a full probe costs a handful of
+output tokens (measured: ~5–100 prompt tokens per request, 5–13 requests per model):
+
+| Step | Requests | Establishes |
+| --- | --- | --- |
+| 1. Candidate discovery | 1 (0 tokens) | A sentinel `reasoning_effort` (`"__probe__"`) makes the request schema fail with a 400 that enumerates the levels it accepts |
+| 2. **Per-value verification** | ≤7 | Only a 200 for a concrete level counts. This is what catches the **second** validation layer (gpt-oss's Harmony, Qwen's own parser), which rejects a subset of the first |
+| 3. Request parameters | 1 (+≤3 retries) | One merged request; a 400 is attributed to a parameter and retried without it. Also yields `function_calling` and `structured_outputs` |
+| 4. Vision | 1 | A 1×1 PNG: 400 `"... is not a multimodal model"` means `vision: false` |
+| 5. Default behaviour | 1 | The same request without `reasoning_effort`; whether thinking text comes back gives `default_enabled` |
+
+Step 2 is why `supported_efforts` can be trusted. The outer schema is a superset: a
+live Qwen3.8-27B advertises `none/minimal/low/medium/high/xhigh/max`, really accepts
+`none/low/medium/xhigh`, and its own error text mentions only three of those four —
+so neither the advertised list nor the error text is the answer, only a request per
+value is.
+
+### What each field claims — and what it does not
+
+- `supported_efforts`: exactly the levels that answered 200, in canonical `none → max` order;
+- `mandatory`: `true` when `none` was rejected, i.e. thinking cannot be turned off;
+- `default_effort` / `default_enabled`: **omitted when the engine does not say** (they
+  are never guessed; OpenRouter's own `reasoning` object, whose shape this follows,
+  omits them the same way);
+- `capabilities.function_calling`: the engine **accepts** `tools` / `tool_choice`
+  (a 400 is a definite "no", a 200 does not promise the model will actually call a
+  tool); `vision` means the engine accepts image content; `structured_outputs` means
+  it accepts `response_format: json_schema`;
+- `supported_parameters`: parameters the engine did **not reject**, named in
+  OpenRouter's namespace. Unknown facts are omitted rather than defaulted.
+
+### When a model is (re-)probed
+
+1. **Startup** — models with no conclusive cache entry, in the background, never blocking the service;
+2. **On `/v1/models`** — a model whose entry is missing, whose engine fingerprint changed, or whose backoff expired; `/v1/models` waits (bounded by `MODEL_PROBE_WAIT`, default 5s) **only while a probe for one of those models is actually in flight**, and never for a model that is in backoff or that the upstream does not validate;
+3. **On a live 400** that blames the reasoning effort — the disproved level is dropped immediately and the model is re-probed in the background; the client still receives the upstream error unchanged and is never delayed;
+4. **`python app.py --probe`** — force a full re-probe of every model and exit.
+
+The engine fingerprint is derived from the model list (`openai.root`, `max_model_len`,
+`owned_by`, `info.updated_at`), so checking it costs no request. It deliberately
+excludes the top-level `created`: vLLM rebuilds its model card on every response and
+stamps it with the current time, so it changes on every fetch.
+
+### Cache, failures and backoff
+
+Results live in `model_probe_cache.json` (version 2, one entry per model, next to
+`session.json`) and hold the effort set, capabilities, parameters, the fingerprint and
+the probe status. A failed or partial probe is cached too, with exponential backoff
+(60s → 6h), so a broken model cannot make `/v1/models` re-probe — and stall — on every
+request. A failed re-probe never discards facts established earlier.
 
 ## Credentials (session.json)
 
@@ -314,6 +407,14 @@ The system may have `HTTP_PROXY`/`HTTPS_PROXY` configured; httpx honors them by 
 **Q: Can reasoning models (DeepSeek-R1 / QwQ etc.) return their thinking process?**
 
 Yes. This proxy passes through **both request and response bodies in full**, without parsing or trimming conversation content: request parameters like `reasoning_effort` / `temperature` are forwarded to the upstream as-is, and `reasoning_content` (DeepSeek style), `reasoning` (newer Open WebUI style), and `<think>` tags in the body all reach the client as-is in both streaming and non-streaming modes (covered by regression tests). Whether the thinking content is visible ultimately depends on two things: whether the upstream Open WebUI returns it (requires a reasoning model and a supporting version), and whether the client renders it (both Cherry Studio and Chatbox do).
+
+**Q: `/v1/models` advertises a `reasoning_effort` level, but calling it returns 400**
+
+It should not happen: every level is verified with a real request before being advertised, and a live 400 that blames the reasoning effort drops that level and re-probes the model in the background. If you still see it, the backend changed after the last probe — check the log for the `probe` lines, and run `python app.py --probe` to re-verify everything immediately.
+
+**Q: Where did the per-model `web_search` / `terminal` / `citations` capability flags go?**
+
+They were never model capabilities: Open WebUI's `info.meta.capabilities` is a deployment-wide default template it merges into every model, so it said the same thing about all of them. They now live once per response, in the `/v1/models` envelope's `x_open_webui.default_model_capabilities`, next to the instance's real feature switches. The per-model `capabilities` object holds only what the engine confirmed by probe.
 
 **Q: Streaming output gets buffered and the client receives everything at once**
 

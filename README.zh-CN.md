@@ -30,11 +30,12 @@ flowchart LR
 
 - **凭证替换**：对外用你自定义的 `PROXY_API_KEY`，对内替换成浏览器抓来的 `Authorization` / `Cookie`，上游永远看不到你的 Proxy Key。
 - **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀，请求返回 404（路由不存在）时还会自动回退到另一个前缀。
-- **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按通用模板白名单透出扩展字段：`max_context_length` / `context_length`（`max_model_len` 作为兼容别名保留）、`quantization`（从模型名解析，如 `NVFP4`）、`capabilities`（含派生的 `function_calling`）与 `description`；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
+- **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按白名单透出有用的扩展字段：`name`、`description`、`max_context_length` / `context_length`（`max_model_len` 作为兼容别名保留）、`quantization`（从模型名解析，如 `NVFP4`）；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
+- **实证而非照抄**：`capabilities`、`architecture`、`supported_parameters`、`reasoning` 全部通过向引擎发请求得出（见[逐模型探测](#逐模型探测思考挡位与能力)），绝不照抄 Open WebUI 的元数据；部署自身的功能开关改放信封的 `x_open_webui`，不会被误读成模型能力。
 
 ## 特性
 
-- **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`，以及未实现路径的 `/v1/*` 兜底透传（同样具备前缀回退）。
+- **OpenAI 兼容**：`/v1/models`、`/v1/models/{id}`、`/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`，以及未实现路径的 `/v1/*` 兜底透传（同样具备前缀回退）。
 - **自动适配上游版本**：`auto` / `v1` / `legacy` 三种上游 API 风格，启动探测 + 请求级回退。
 - **健壮的流式转发**：客户端断开时主动关闭上游连接，不会把连接挂到超时；正确剔除逐跳响应头。
 - **OpenAI 风格错误体**：返回 `{"error": {"message", "type", "code"}}`，而不是 FastAPI 默认的 `{"detail": ...}`，客户端能正常显示错误原因。
@@ -49,6 +50,7 @@ flowchart LR
 .
 ├── app.py                  # FastAPI 路由、OpenAI 兼容层、CLI 入口
 ├── config.py               # 全部配置项（环境变量 / .env）
+├── model_probe.py          # 逐模型探测：报错解析、探测载荷、缓存
 ├── session_store.py        # 凭证读写 + Playwright 浏览器登录抓取
 ├── upstream.py             # 上游转发：连接池、前缀探测、流式
 ├── requirements.txt        # 运行服务的最小依赖
@@ -111,7 +113,7 @@ python app.py
 python app.py              # 启动服务（必要时先登录）
 python app.py --login      # 强制重新登录，刷新凭证
 python app.py --check      # 只校验凭证与上游连通性，打印摘要后退出
-python app.py --probe      # 强制重探所有模型的思考挡位并刷新缓存
+python app.py --probe      # 强制全量重探（挡位 + 能力）并刷新缓存
 python app.py --port 9000  # 临时覆盖监听端口
 ```
 
@@ -186,12 +188,15 @@ for await (const part of stream) {
 | ---- | ---------------------- | -- | ------------------------- |
 | GET  | `/`                    | 否* | 服务信息与已注册端点；上游地址仅在带 Key 时返回 |
 | GET  | `/healthz`             | 否* | 健康检查恒 200；上游地址与探测前缀仅在带 Key 时返回 |
-| GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构，并附带思考挡位信息   |
+| GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构，并附带实证的能力 / 参数 / 思考挡位；信封还带 `x_open_webui` 实例元信息 |
+| GET  | `/v1/models/{id}`      | 是  | 获取单个模型（`id` 可含斜杠）；未知 id 返回 OpenAI 风格 404 错误体 |
 | POST | `/v1/chat/completions` | 是  | 对话补全，支持 `stream: true`    |
 | POST | `/v1/embeddings`       | 是  | 向量嵌入（上游需支持）               |
 | ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径             |
 
 鉴权支持 `Authorization: Bearer <key>` 与 `X-API-Key: <key>` 两种写法。若 `PROXY_API_KEY` 留空则不鉴权。
+
+`/v1/models` 的查询参数会被忽略，这与 OpenAI 官方端点一致（它本身没有分页；只有 Anthropic 与 Gemini 那两种不同形状的 API 才实现了分页）。
 
 \* `/` 与 `/healthz` 保持免鉴权（探针与就绪检查友好），但响应里的 `upstream` / `upstream_prefix` 字段只在请求携带有效 Key（或未启用鉴权）时返回，避免公网部署时泄漏上游内网域名。
 
@@ -210,10 +215,11 @@ for await (const part of stream) {
 | `REQUEST_TIMEOUT`     | `300`                   | 上游请求总超时（秒）                             |
 | `CONNECT_TIMEOUT`     | `10`                    | 连接上游超时（秒）                              |
 | `SESSION_FILE`        | `session.json`          | 凭证文件路径                                 |
-| `REASONING_CACHE_FILE` | `reasoning_cache.json` | 思考挡位缓存文件路径                             |
-| `REASONING_PROBE_CONCURRENCY` | `4`             | 挡位探测的并发数                               |
-| `REASONING_PROBE_TIMEOUT`     | `30`            | 单个模型挡位探测的超时（秒）                        |
-| `REASONING_PROBE_WAIT`        | `5`             | `/v1/models` 发现挡位缺失时等待探测完成的最长秒数，`0` = 立即返回 |
+| `MODEL_PROBE_CACHE_FILE` | `model_probe_cache.json` | 逐模型探测缓存文件路径                                                     |
+| `MODEL_PROBE_CONCURRENCY` | `4`             | 探测请求的并发数                                                            |
+| `MODEL_PROBE_TIMEOUT`     | `30`            | 单个模型探测的超时（秒）                                                     |
+| `MODEL_PROBE_WAIT`        | `5`             | `/v1/models` 在**确有探测飞行中**时等待的最长秒数，`0` = 从不等待                |
+| `EXPOSE_INSTANCE_META`    | `true`          | `/v1/models` 信封是否携带 `x_open_webui`（严格校验的客户端可关闭）              |
 | `MODEL_ALIASES`       | 空                       | JSON 对象，模型名映射                          |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`，非法值回退 `INFO` |
 | `DEBUG`               | `false`                 | 为 `true` 时等价于 `LOG_LEVEL=DEBUG`        |
@@ -221,36 +227,114 @@ for await (const part of stream) {
 | `LOGIN_QUIET_PERIOD`  | `6`                     | 抓到凭证后继续观察的秒数                           |
 | `LOGIN_HEADLESS`      | `false`                 | 是否无头启动浏览器                              |
 
-## 思考挡位探测（reasoning_effort）
+## 逐模型探测（思考挡位与能力）
 
-`/v1/models` 会为每个模型附带一个 `reasoning` 字段，声明该模型支持的思考挡位：
+`/v1/models` 会为每个模型附带四个**实证**字段：
 
 ```json
 {
-  "id": "GLM-5.3-Flash",
+  "id": "Qwen3.8-27B",
   "object": "model",
-  "...": "...",
+  "created": 1787109489,
+  "owned_by": "vllm",
+  "name": "Qwen3.8-27B",
+  "max_model_len": 262144,
+  "max_context_length": 262144,
+  "context_length": 262144,
+  "architecture": {
+    "modality": "text->text",
+    "input_modalities": ["text"],
+    "output_modalities": ["text"]
+  },
+  "supported_parameters": ["reasoning_effort", "response_format", "temperature", "tools", "..."],
+  "capabilities": {
+    "vision": false,
+    "function_calling": true,
+    "reasoning": true,
+    "structured_outputs": true
+  },
   "reasoning": {
-    "supported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-    "default_effort": "medium",
-    "default_enabled": true,
-    "mandatory": false
+    "supported_efforts": ["none", "low", "medium", "xhigh"],
+    "mandatory": false,
+    "default_effort": "xhigh",
+    "default_enabled": true
   }
 }
 ```
 
-**探测原理**：上游（vLLM 等）把 `reasoning_effort` 声明为 Literal 枚举校验。本代理向每个模型发送一个携带哨兵值 `"__probe__"` 的最小补全请求（`max_tokens=1`），上游校验失败返回 400，错误文本恰好枚举该模型接受的全部挡位（`Input should be 'none', 'low', 'medium' or 'high'`）。校验发生在生成之前，因此**一次探测的 token 成本为零**。
+### 为什么能力只能靠探测
 
-**缓存策略**：挡位与模型挂钩，探测结果持久化到 `reasoning_cache.json`。之后每次启动，只要模型列表没有变化就直接复用缓存（日志显示"跳过探测"）；模型列表有增删时，只探测新增的模型。运行期间 `/v1/models` 发现缓存未覆盖的新模型时，会触发后台补探，并默认最多等待 5 秒（`REASONING_PROBE_WAIT`）让探测完成再返回——探测通常亚秒级完成，客户端首次请求即可拿到完整挡位；超时则先返回现有内容，字段在下次请求出现。
+Open WebUI 会给每个模型上报 `info.meta.capabilities`，但那是它的**默认模型元数据模板
+合并进每个模型**的结果——各模型的键完全一致，与具体引擎能做什么无关。在真实部署里，
+所有模型都声称 `vision: true`，而其中一个对图片的回答是 HTTP 400
+`"... is not a multimodal model"`；所有模型都声称 `web_search: true`，而同一实例的
+`/api/config` 里写着 `enable_web_search: false`。因此本代理**直接问引擎**来确定能力，
+并把上游那份模板作为**实例事实**输出一次，放在信封的 `x_open_webui` 下：
 
-**字段推导规则**（探测只能揭示"接受哪些值"，其余字段为启发式推导）：
+```json
+{
+  "object": "list",
+  "data": [ ... ],
+  "x_open_webui": {
+    "name": "GENAI Chat (Open WebUI)",
+    "version": "0.9.2",
+    "features": { "enable_web_search": false, "..." : "..." },
+    "default_model_capabilities": { "vision": true, "web_search": true, "..." : "..." }
+  }
+}
+```
 
-- `supported_efforts`：上游校验接受的确切集合，按 `none → max` 规范顺序输出；
-- `default_effort`：支持 `medium` 则为 `medium`，否则取中位数挡位；
-- `mandatory`：集合中没有 `none` 时为 `true`，即无法关闭思考；
-- `default_enabled`：恒为 `true`（字段被接受即思考默认开启）。
+`default_model_capabilities` 只包含**所有上报模型都一致**的键；上游并非一致上报的键
+（某部署里有一个模型没有 `usage`）不进模板，而确实上报了它的模型会把自身取值放在该模型
+的 `x_open_webui.capabilities` 里。无论模板是否存在，`/v1/models` 的形状都保持不变；
+`EXPOSE_INSTANCE_META=false` 则完全去掉 `x_open_webui`。
 
-强制全量重探：`python app.py --probe`（适用于上游重新部署后模型名未变、挡位却变了的情况）。
+### 一次探测做了什么
+
+每一步都是 `max_tokens=1` 的真实请求，完整探测只花费个位数输出 token
+（实测：每次请求约 5–100 prompt token，每模型 5–13 次请求）：
+
+| 步骤 | 请求数 | 得到什么 |
+| --- | --- | --- |
+| 1. 候选发现 | 1（0 token） | 发送哨兵 `reasoning_effort`（`"__probe__"`），请求 schema 以 400 失败并枚举它接受的挡位 |
+| 2. **逐值实证** | ≤7 | 只有具体挡位返回 200 才算数。这正是抓住**第二层**校验（gpt-oss 的 Harmony、Qwen 自带解析器）的关键——它会拒绝第一层的子集 |
+| 3. 请求参数 | 1（+≤3 次重试） | 一次合并请求；400 会归因到某个参数并剔除后重试。同时得出 `function_calling` 与 `structured_outputs` |
+| 4. 视觉 | 1 | 一张 1×1 PNG：返回 400 `"... is not a multimodal model"` 即 `vision: false` |
+| 5. 默认行为 | 1 | 同样的请求但不带 `reasoning_effort`；是否返回思考文本给出 `default_enabled` |
+
+第 2 步是 `supported_efforts` 可信的原因。外层 schema 是**超集**：线上 Qwen3.8-27B 广告
+`none/minimal/low/medium/high/xhigh/max`，实际只接受 `none/low/medium/xhigh`，而它自己的
+报错文本只提到这 4 个中的 3 个——所以既不能照抄广告，也不能照抄报错，只能逐值发请求。
+
+### 各字段声称什么、不声称什么
+
+- `supported_efforts`：返回 200 的确切挡位集合，按 `none → max` 规范顺序；
+- `mandatory`：`none` 被拒绝时为 `true`，即思考无法关闭；
+- `default_effort` / `default_enabled`：**引擎没说就省略**（绝不猜；本项目 `reasoning`
+  对象所对齐的 OpenRouter 也是同样做法）；
+- `capabilities.function_calling`：引擎**接受** `tools` / `tool_choice`（400 是明确的
+  "不支持"，200 不承诺模型真的会调用工具）；`vision` 表示引擎接受图片内容；
+  `structured_outputs` 表示接受 `response_format: json_schema`；
+- `supported_parameters`：引擎**没有拒绝**的参数，采用 OpenRouter 的参数命名。
+  拿不准的事实一律省略，而不是给默认值。
+
+### 什么时候会（重新）探测
+
+1. **启动时**——对没有结论性缓存条目的模型后台探测，绝不阻塞服务；
+2. **`/v1/models` 时**——条目缺失、引擎指纹变化、或退避已过期的模型；`/v1/models` 只在**确实有这些模型的探测在飞行中**时等待（上限 `MODEL_PROBE_WAIT`，默认 5 秒），处于退避中或上游根本不校验的模型绝不等待；
+3. **收到线上 400 且报错归咎于思考挡位时**——立即剔除被证伪的挡位并在后台重探；客户端收到的错误保持原样，也绝不因此被拖延；
+4. **`python app.py --probe`**——强制全量重探后退出。
+
+引擎指纹从模型列表推导（`openai.root`、`max_model_len`、`owned_by`、`info.updated_at`），
+因此检查它不需要任何请求。它刻意排除顶层 `created`：vLLM 每次响应都重建模型卡并打上
+当前时间，所以它每次拉取都会变。
+
+### 缓存、失败与退避
+
+结果存放在 `model_probe_cache.json`（版本 2，每模型一条，位于 `session.json` 旁边），
+包含挡位集合、能力、参数、指纹与探测状态。失败或不完整的探测同样落盘，并带指数退避
+（60 秒 → 6 小时），因此坏模型不会让 `/v1/models` 每次请求都重探并卡住。重探失败也绝不
+丢弃此前已确立的事实。
 
 ## 凭证（session.json）
 
@@ -314,6 +398,14 @@ python app.py --login
 **Q: 推理模型（DeepSeek-R1 / QwQ 等）的思考过程能返回吗？**
 
 能。本代理对**请求体和响应体都是全量透传**，不解析、不裁剪对话内容：`reasoning_effort` / `temperature` 等请求参数原样转发给上游，`reasoning_content`（DeepSeek 风格）、`reasoning`（Open WebUI 新版风格）以及正文中的 `<think>` 标签在流式与非流式下都原样到达客户端（有回归测试保障）。思考内容是否可见最终取决于两点：上游 Open WebUI 是否返回（需使用推理模型且版本支持），以及客户端是否识别展示（Cherry Studio / Chatbox 均支持）。
+
+**Q: `/v1/models` 广告了某个 `reasoning_effort` 挡位，调用却返回 400？**
+
+正常情况下不会发生：每个挡位在对外声明前都用真实请求实证过，且线上归咎于思考挡位的 400 会立即剔除该挡位并在后台重探该模型。如果仍然出现，说明后端在上次探测之后变了——看日志里的 `probe` 行，并用 `python app.py --probe` 立即重验全部模型。
+
+**Q: 每个模型的 `web_search` / `terminal` / `citations` 能力标记去哪了？**
+
+它们从来不是模型能力：Open WebUI 的 `info.meta.capabilities` 是它合并进每个模型的部署级默认模板，所以对所有权模型说的都是同一套。现在它们作为**实例事实**每份响应只出现一次，位于 `/v1/models` 信封的 `x_open_webui.default_model_capabilities`，与实例真实的功能开关放在一起。模型级 `capabilities` 只保留引擎实证过的内容。
 
 **Q: 流式输出被缓冲，客户端一次性收到全部内容**
 

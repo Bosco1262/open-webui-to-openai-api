@@ -20,15 +20,37 @@ from __future__ import annotations
 import locale
 import os
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 LANG_ZH = "zh"
 LANG_EN = "en"
 LANG_AUTO = "auto"
 
-# Messages: key -> (en, zh)
-# 消息表：key -> (英文, 中文)
-_MESSAGES: Dict[str, Tuple[str, str]] = {
+
+class Message(NamedTuple):
+    """
+    One translatable message, with both languages as named fields.
+
+    Replaces the previous (en, zh) tuple that callers indexed with 0/1 -- a magic
+    index that quietly breaks the moment a third language is added.
+
+    一条可翻译消息，两种语言各有具名字段。
+
+    取代此前用 0/1 下标访问的 (en, zh) 元组——那是"魔法下标"，
+    一旦加入第三种语言就会静默出错。
+    """
+
+    en: str
+    zh: str
+
+
+# Raw message table: key -> (english, chinese). Kept as plain tuples for
+# readability at this size; converted into Message objects below so nothing
+# downstream ever indexes a language by position.
+#
+# 原始消息表：key -> (英文, 中文)。这个体量下用普通元组更好读；下面会转换成
+# Message 对象，使下游代码永远不必用位置下标去取某种语言。
+_MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     # ---------------- config.py ----------------
     "int_invalid": (
         "{name}={raw!r} is not a valid integer, falling back to default {default}",
@@ -180,6 +202,10 @@ _MESSAGES: Dict[str, Tuple[str, str]] = {
         "Upstream /models returned invalid JSON: {text}",
         "上游 /models 返回的不是合法 JSON：{text}",
     ),
+    "err_model_not_found": (
+        "The model '{model}' does not exist",
+        "模型 '{model}' 不存在",
+    ),
     "err_upstream_unauthorized": (
         "Open WebUI rejected this request (credentials may have expired). "
         "Run `python app.py --login` to log in again.",
@@ -218,6 +244,10 @@ _MESSAGES: Dict[str, Tuple[str, str]] = {
         "ANY  /v1/{path}  (passthrough)",
         "ANY  /v1/{path}  (透传)",
     ),
+    "endpoint_retrieve_model": (
+        "GET  /v1/models/{id}",
+        "GET  /v1/models/{id}",
+    ),
     "cli_description": (
         "Open WebUI -> OpenAI API reverse proxy",
         "Open WebUI -> OpenAI API 反向代理",
@@ -246,56 +276,56 @@ _MESSAGES: Dict[str, Tuple[str, str]] = {
         "Output language: zh / en / auto (default: auto = follow the system language, English if undetectable)",
         "输出语言：zh / en / auto（默认 auto = 系统语言，检测不到时用英文）",
     ),
-    # ---------------- reasoning probe / 思考挡位探测 ----------------
-    "reasoning_cache_fresh": (
-        "Reasoning-effort cache is up to date ({count} model(s)); skipping probe",
-        "思考挡位缓存已是最新（{count} 个模型），跳过探测",
+    # ---------------- per-model probe / 逐模型探测 ----------------
+    "probe_cache_fresh": (
+        "Per-model probe cache is up to date ({count} model(s)); skipping probe",
+        "逐模型探测缓存已是最新（{count} 个模型），跳过探测",
     ),
-    "reasoning_cache_saved": (
-        "Reasoning-effort cache saved to {path} ({count} model(s))",
-        "思考挡位缓存已保存到 {path}（{count} 个模型）",
+    "probe_cache_saved": (
+        "Per-model probe cache saved to {path} ({count} model(s))",
+        "逐模型探测缓存已保存到 {path}（{count} 个模型）",
     ),
     "probe_begin": (
-        "Probing reasoning efforts for {count} model(s): {models}",
-        "开始探测 {count} 个模型的思考挡位：{models}",
+        "Probing {count} model(s): {models}",
+        "开始探测 {count} 个模型：{models}",
     ),
-    "probe_model_ok": (
-        "  {model}: {efforts}",
-        "  {model}：{efforts}",
-    ),
-    "probe_model_unprobeable": (
-        "  {model}: upstream accepted the probe value without validation; no effort info available",
-        "  {model}：上游未校验探测值，无法获知挡位",
+    "probe_model_done": (
+        "  {model}: {summary}",
+        "  {model}：{summary}",
     ),
     "probe_model_failed": (
-        "  {model}: probe failed ({exc}); will retry on next refresh",
-        "  {model}：探测失败（{exc}），下次刷新时重试",
+        "  {model}: probe failed ({exc}); will retry with backoff",
+        "  {model}：探测失败（{exc}），将按退避重试",
     ),
     "probe_auth_expired": (
-        "Credentials expired while probing reasoning efforts (HTTP {status}); aborting",
-        "探测思考挡位期间凭证失效（HTTP {status}），已中止",
+        "Credentials expired while probing (HTTP {status}); aborting",
+        "探测期间凭证失效（HTTP {status}），已中止",
     ),
     "probe_finished": (
-        "Reasoning-effort probe finished: {probed} probed, {unknown} unprobeable, {failed} failed",
-        "思考挡位探测完成：成功 {probed} 个，不可探测 {unknown} 个，失败 {failed} 个",
+        "Probe finished: {ok} complete, {partial} partial, {unprobeable} unprobeable, {failed} failed",
+        "探测完成：完整 {ok} 个，部分 {partial} 个，不可探测 {unprobeable} 个，失败 {failed} 个",
     ),
     "probe_models_failed": (
-        "Cannot fetch the model list for the reasoning-effort probe (HTTP {status})",
-        "无法获取模型列表以进行思考挡位探测（HTTP {status}）",
+        "Cannot fetch the model list for probing (HTTP {status})",
+        "无法获取模型列表以进行探测（HTTP {status}）",
     ),
     "probe_task_error": (
-        "Reasoning-effort refresh task crashed: {exc}",
-        "思考挡位刷新任务异常终止：{exc}",
+        "Probe refresh task crashed: {exc}",
+        "探测刷新任务异常终止：{exc}",
     ),
     "probe_wait_timeout": (
-        "Reasoning-effort refresh did not finish within {wait}s; serving the model "
-        "list without full reasoning info (it will appear once the background refresh lands)",
-        "思考挡位刷新未在 {wait} 秒内完成，本次模型列表先不带完整挡位信息返回"
+        "Probe refresh did not finish within {wait}s; serving the model list without "
+        "the unfinished fields (they appear once the background refresh lands)",
+        "探测刷新未在 {wait} 秒内完成，本次模型列表先不带未完成的字段返回"
         "（后台刷新完成后即可看到）",
     ),
+    "instance_meta_failed": (
+        "Instance metadata (/api/config) unavailable: {exc}",
+        "实例元信息（/api/config）不可用：{exc}",
+    ),
     "cli_probe_help": (
-        "Force a refresh of the reasoning-effort cache, then exit",
-        "强制刷新思考挡位缓存后退出",
+        "Force a refresh of the per-model probe cache, then exit",
+        "强制刷新逐模型探测缓存后退出",
     ),
     # ---------------- session_store.py ----------------
     "playwright_missing": (
@@ -425,6 +455,12 @@ _MESSAGES: Dict[str, Tuple[str, str]] = {
     ),
 }
 
+# Named-field view of the table above; this is what the rest of the module uses.
+# 上表的具名字段视图；本模块其余部分只使用这一份。
+_MESSAGES: Dict[str, Message] = {
+    key: Message(*texts) for key, texts in _MESSAGE_TEXTS.items()
+}
+
 # Current language; initialized with the system language at import time
 # 当前语言；导入时按系统语言初始化
 _current: str = LANG_EN
@@ -516,8 +552,10 @@ def t(key: str, **fmt: object) -> str:
     of crashing at runtime.
     未知 key 回退为 key 本身，拼写错误只会退化为原文而不会在运行时崩溃。
     """
-    pair = _MESSAGES.get(key)
-    text = pair[1] if pair and _current == LANG_ZH else (pair[0] if pair else key)
+    message = _MESSAGES.get(key)
+    if message is None:
+        return key
+    text = message.zh if _current == LANG_ZH else message.en
     return text.format(**fmt) if fmt else text
 
 

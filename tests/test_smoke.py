@@ -27,7 +27,15 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mock_openwebui import ABORT_MODEL, ERROR_MODEL, REASONING_MODEL, VALID_TOKEN  # noqa: E402
+from mock_openwebui import (  # noqa: E402
+    ABORT_MODEL,
+    ERROR_MODEL,
+    MODELS,
+    NO_TOOLS_MODEL,
+    REASONING_MODEL,
+    TEXT_ONLY_MODEL,
+    VALID_TOKEN,
+)
 
 PROXY_KEY = "sk-test-proxy-key"
 PASSED: list = []
@@ -77,7 +85,14 @@ class ProxyProcess:
         extra_env: Optional[Dict[str, str]] = None,
     ):
         self.port = free_port()
-        self.log_file = Path(tempfile.mkdtemp(prefix="owui-proxy-")) / "proxy.log"
+        # Every per-run artifact lives in this run's own directory: the proxy must
+        # never write its session, probe cache or log into the checkout.
+        #
+        # 每次运行的所有产物都放在本次运行自己的目录里：代理绝不能把凭证、探测缓存
+        # 或日志写进代码仓库。
+        self.workdir = Path(tempfile.mkdtemp(prefix="owui-proxy-"))
+        self.log_file = self.workdir / "proxy.log"
+        self.cache_file = self.workdir / "model_probe_cache.json"
         self.base = f"http://127.0.0.1:{self.port}"
 
         env = os.environ.copy()
@@ -91,7 +106,8 @@ class ProxyProcess:
                 # Loopback test: must bypass the system proxy
                 # 本地回环测试，必须绕过系统代理
                 "UPSTREAM_TRUST_ENV": "false",
-                "SESSION_FILE": str(session_file) if session_file else str(Path(tempfile.gettempdir()) / "definitely-missing-session.json"),
+                "SESSION_FILE": str(session_file) if session_file else str(self.workdir / "missing-session.json"),
+                "MODEL_PROBE_CACHE_FILE": str(self.cache_file),
                 "LOG_LEVEL": "INFO",
                 "PYTHONPATH": str(REPO_ROOT),
                 "PYTHONUNBUFFERED": "1",
@@ -228,7 +244,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         check(f"[{style}] /v1/models 返回 200", resp.status_code == 200, str(body)[:200])
         check(f"[{style}] 顶层 object=list", body.get("object") == "list", str(body)[:200])
         data = body.get("data") or []
-        check(f"[{style}] 模型条目完整", len(data) == 2, str(len(data)))
+        check(f"[{style}] 模型条目完整", len(data) == len(MODELS["data"]), str(len(data)))
         first = data[0] if data else {}
         check(
             f"[{style}] 模型字段符合 OpenAI 结构",
@@ -552,73 +568,187 @@ def run_cors_case(server_url: str) -> None:
         proxy.stop()
 
 
-def run_reasoning_case(server_url: str) -> None:
-    print("\n=== Scenario: reasoning-effort probe & cache / 场景：思考挡位探测与缓存 ===")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-reasoning-"))
+def run_probe_case(server_url: str) -> None:
+    print("\n=== Scenario: per-model probe & cache / 场景：逐模型探测与缓存 ===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-probe-"))
     session_file = make_session(tmp_dir / "session.json")
-    cache_file = tmp_dir / "reasoning_cache.json"
-    proxy = ProxyProcess(
-        server_url,
-        session_file,
-        "v1",
-        extra_env={"REASONING_CACHE_FILE": str(cache_file)},
-    )
+    proxy = ProxyProcess(server_url, session_file, "v1")
+    # ProxyProcess points the probe cache at this run's own directory, so the smoke
+    # tests never touch the checkout's model_probe_cache.json.
+    #
+    # ProxyProcess 已把探测缓存指向本次运行自己的目录，因此冒烟测试不会碰到仓库里的
+    # model_probe_cache.json。
+    cache_file = proxy.cache_file
     try:
         if not proxy.wait():
-            check("[reasoning] 代理启动", False, proxy.dump_log())
+            check("[probe] 代理启动", False, proxy.dump_log())
             return
-        client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
+        client = httpx.Client(base_url=proxy.base, timeout=60.0, trust_env=False)
 
         # The startup refresh runs in the background; poll until the probe lands.
         # 启动时的刷新在后台进行；轮询直到探测结果落进 /v1/models。
-        llama_reasoning = None
-        deadline = time.time() + 30
+        models = {}
+        deadline = time.time() + 60
         while time.time() < deadline:
-            resp = client.get("/v1/models", headers=headers())
-            data = (resp.json() or {}).get("data") or []
-            llama = next((m for m in data if m.get("id") == "llama3:latest"), {})
-            llama_reasoning = llama.get("reasoning")
-            if llama_reasoning:
+            body = client.get("/v1/models", headers=headers()).json() or {}
+            models = {model.get("id"): model for model in body.get("data") or []}
+            if (models.get("llama3:latest") or {}).get("capabilities"):
                 break
             time.sleep(0.3)
 
-        check("[reasoning] 探测完成后 /v1/models 带 reasoning 字段", llama_reasoning is not None, str(llama_reasoning))
+        body = client.get("/v1/models", headers=headers()).json() or {}
+        models = {model.get("id"): model for model in body.get("data") or []}
+        llama = models.get("llama3:latest") or {}
+
+        # --- reasoning efforts -------------------------------------------------
+        llama_reasoning = llama.get("reasoning")
+        check("[probe] 探测完成后 /v1/models 带 reasoning 字段", llama_reasoning is not None, str(llama))
         if llama_reasoning:
             check(
-                "[reasoning] 全挡位模型枚举完整",
+                "[probe] 两层一致的模型枚举完整",
                 llama_reasoning.get("supported_efforts")
                 == ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
                 str(llama_reasoning),
             )
             check(
-                "[reasoning] 默认挡位为 medium",
-                llama_reasoning.get("default_effort") == "medium",
+                "[probe] 含 none 时非强制思考",
+                llama_reasoning.get("mandatory") is False,
                 str(llama_reasoning),
             )
             check(
-                "[reasoning] 含 none 时非强制思考",
-                llama_reasoning.get("mandatory") is False
-                and llama_reasoning.get("default_enabled") is True,
+                "[probe] 引擎未声明默认挡位时不猜",
+                "default_effort" not in llama_reasoning,
                 str(llama_reasoning),
             )
 
-        resp = client.get("/v1/models", headers=headers())
-        data = (resp.json() or {}).get("data") or []
-        legacy = next((m for m in data if m.get("id") == "legacy-model"), {})
+        # The regression that motivated this design: the outer schema advertises seven
+        # levels, the model's own parser accepts four, and its error text mentions only
+        # three of them. Only per-value verification gets this right.
+        #
+        # 促成这套设计的回归用例：外层 schema 广告 7 个挡位，模型自带解析器只接受 4 个，
+        # 而它的报错文本只提到其中 3 个。只有逐值实证才能得到正确答案。
+        legacy_reasoning = (models.get("legacy-model") or {}).get("reasoning") or {}
         check(
-            "[reasoning] 部分挡位模型按上游实际枚举",
-            (legacy.get("reasoning") or {}).get("supported_efforts") == ["none", "low", "medium", "high"],
-            str(legacy.get("reasoning")),
+            "[probe] 两层不一致时按实证结果而非报错文本枚举",
+            legacy_reasoning.get("supported_efforts") == ["none", "low", "medium", "xhigh"],
+            str(legacy_reasoning),
         )
-        unprobeable = next((m for m in data if m.get("id") == REASONING_MODEL), {})
         check(
-            "[reasoning] 上游不校验哨兵值的模型不带 reasoning 字段",
+            "[probe] 从第二层报错里提取到 (default) 标注",
+            legacy_reasoning.get("default_effort") == "xhigh",
+            str(legacy_reasoning),
+        )
+
+        unprobeable = models.get(REASONING_MODEL) or {}
+        check(
+            "[probe] 上游不校验哨兵值的模型不带 reasoning 字段",
             "reasoning" not in unprobeable,
             str(unprobeable),
         )
         check(
-            "[reasoning] 缓存文件已生成",
-            cache_file.exists() and "models" in (cache_file.read_text(encoding="utf-8") or ""),
+            "[probe] 不校验挡位也能得出能力与默认思考",
+            unprobeable.get("capabilities", {}).get("vision") is True
+            and (unprobeable.get("reasoning") is None)
+            and unprobeable.get("supported_parameters") is not None,
+            str(unprobeable),
+        )
+
+        # --- capabilities: probed, not echoed from the default template ---------
+        no_tools = (models.get(NO_TOOLS_MODEL) or {}).get("capabilities") or {}
+        check(
+            "[probe] 无 tool-call parser 的引擎 function_calling=false",
+            no_tools.get("function_calling") is False,
+            str(no_tools),
+        )
+        text_only = (models.get(TEXT_ONLY_MODEL) or {}).get("capabilities") or {}
+        check(
+            "[probe] 非多模态引擎 vision=false",
+            text_only.get("vision") is False,
+            str(text_only),
+        )
+        check(
+            "[probe] capabilities 只含实证键",
+            set(text_only.keys()) <= {"vision", "function_calling", "reasoning", "structured_outputs"},
+            str(text_only),
+        )
+        check(
+            "[probe] 模态由视觉探测推导",
+            (models.get(TEXT_ONLY_MODEL) or {}).get("architecture")
+            == {"modality": "text->text", "input_modalities": ["text"], "output_modalities": ["text"]},
+            str((models.get(TEXT_ONLY_MODEL) or {}).get("architecture")),
+        )
+        check(
+            "[probe] 参数支持声明来自实证",
+            isinstance(no_tools and (models.get(NO_TOOLS_MODEL) or {}).get("supported_parameters"), list)
+            and "tools" not in ((models.get(NO_TOOLS_MODEL) or {}).get("supported_parameters") or []),
+            str((models.get(NO_TOOLS_MODEL) or {}).get("supported_parameters")),
+        )
+
+        # --- instance metadata moved out of the model capability field ----------
+        instance = body.get("x_open_webui") or {}
+        check(
+            "[probe] 实例级功能开关放在信封的 x_open_webui",
+            instance.get("features", {}).get("enable_web_search") is False
+            and bool(instance.get("default_model_capabilities")),
+            str(instance)[:200],
+        )
+        check(
+            "[probe] 不再把上游默认能力模板当成模型能力",
+            "web_search" not in (llama.get("capabilities") or {})
+            and "builtin_tools" not in (llama.get("capabilities") or {}),
+            str(llama.get("capabilities")),
+        )
+
+        # --- retrieve a single model -------------------------------------------
+        resp = client.get("/v1/models/llama3:latest", headers=headers())
+        check(
+            "[probe] GET /v1/models/{id} 返回该模型",
+            resp.status_code == 200 and (resp.json() or {}).get("id") == "llama3:latest",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        resp = client.get("/v1/models/does-not-exist", headers=headers())
+        check(
+            "[probe] 未知模型 id 返回 404 JSON 错误体",
+            resp.status_code == 404
+            and resp.json().get("error", {}).get("code") == "model_not_found",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+
+        # --- a live 400 disproves an advertised level and heals the cache -------
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={
+                "model": "legacy-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "high",
+            },
+        )
+        check(
+            "[probe] 上游 400 原样透出（客户端行为不变）",
+            resp.status_code == 400
+            and resp.json().get("error", {}).get("code") == "upstream_error"
+            and "Unexpected reasoning effort high" in resp.text,
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        healed = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            body = client.get("/v1/models", headers=headers()).json() or {}
+            entry = next((m for m in body.get("data") or [] if m.get("id") == "legacy-model"), {})
+            healed = (entry.get("reasoning") or {}).get("supported_efforts")
+            if healed and "high" not in healed:
+                break
+            time.sleep(0.3)
+        check(
+            "[probe] 线上 400 之后不再广告该挡位",
+            healed is not None and "high" not in healed,
+            str(healed),
+        )
+
+        check(
+            "[probe] 缓存文件已生成（v2）",
+            cache_file.exists() and '"version": 2' in (cache_file.read_text(encoding="utf-8") or ""),
         )
 
         client.close()
@@ -640,7 +770,7 @@ def main() -> int:
         run_case(server.base_url, "legacy", "/api")
         run_missing_session_case(server.base_url)
         run_cors_case(server.base_url)
-        run_reasoning_case(server.base_url)
+        run_probe_case(server.base_url)
     finally:
         server.stop()
 

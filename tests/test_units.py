@@ -29,6 +29,15 @@ import lang as lang_module  # noqa: E402
 import model_probe as mprobe  # noqa: E402
 import session_store as store  # noqa: E402
 
+# A Windows console whose code page cannot represent every character the script prints
+# (cp936 here) would otherwise abort the run with UnicodeEncodeError *after* the last
+# check, reporting a failure that never happened.
+#
+# 在无法表示全部输出字符的 Windows 控制台（此处 cp936）上，若不做处理，脚本会在最后一个
+# 检查之后抛 UnicodeEncodeError 中止，报告一个并不存在的失败。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 PASSED: list = []
 FAILED: list = []
 
@@ -108,6 +117,36 @@ def test_session_file() -> None:
         check("凭证为空抛 SessionInvalid", False)
     except store.SessionInvalid:
         check("凭证为空抛 SessionInvalid", True)
+
+    # load_session() caches the parsed file (it runs on every request); a replaced file
+    # must still be visible.
+    # load_session() 会缓存解析结果（它每个请求都会跑）；文件被替换后必须仍能被看到。
+    (tmp / "session.json").write_text('{"authorization": "Bearer first"}', encoding="utf-8")
+    check("首次读取成功", store.load_session(settings).authorization == "Bearer first")
+    check("命中缓存仍返回同一凭证", store.load_session(settings).authorization == "Bearer first")
+    (tmp / "session.json").write_text(
+        '{"authorization": "Bearer second-longer"}', encoding="utf-8"
+    )
+    check(
+        "文件被替换后缓存失效",
+        store.load_session(settings).authorization == "Bearer second-longer",
+        "mtime/size 变化必须让缓存失效",
+    )
+    # An invalid file must not be cached as a failure either: once it is fixed, the valid
+    # credentials must be visible immediately.
+    # 无效文件同样不得把"失败"缓存下来：修好之后必须能立刻读到有效凭证。
+    (tmp / "session.json").write_text('{"cookie": ""}', encoding="utf-8")
+    try:
+        store.load_session(settings)
+        cached_failure = True
+    except store.SessionInvalid:
+        cached_failure = False
+    (tmp / "session.json").write_text('{"cookie": "a=1; b=2"}', encoding="utf-8")
+    check(
+        "失败的读取不会被缓存（修好后立即可用）",
+        not cached_failure and store.load_session(settings).cookie == "a=1; b=2",
+        "SessionInvalid 之后必须能立刻读到修复后的内容",
+    )
 
 
 def test_login_signal() -> None:
@@ -336,6 +375,13 @@ def test_config() -> None:
         check("非法整数回退默认值", settings.proxy_port == 8000, str(settings.proxy_port))
         check("解析模型别名", settings.resolve_model("gpt-4o") == "gpt-4o-mini")
         check("未配置的模型原样返回", settings.resolve_model("llama3") == "llama3")
+        check("model 为 null 时原样返回", settings.resolve_model(None) is None)
+        check(
+            "model 非字符串原样返回（别名映射不抛 TypeError）",
+            settings.resolve_model({"a": 1}) == {"a": 1}
+            and settings.resolve_model(["a"]) == ["a"],
+            "dict/list 必须不被哈希、原样返回",
+        )
         check("非法风格回退 auto", settings.upstream_api_style == "auto")
         check("展开 ~ 路径", "~" not in str(settings.session_file), str(settings.session_file))
 
@@ -434,13 +480,23 @@ def test_credentials_are_valid() -> None:
     print("\n--- Upstream validation of captured credentials / 抓取凭证的上游校验 ---")
     import asyncio
 
+    import mock_openwebui as mock_module
     from mock_openwebui import VALID_TOKEN, MockOpenWebUI
 
     server = MockOpenWebUI()
     server.start()
     try:
         settings = config_module.load_settings()
-        settings = type(settings)(**{**settings.__dict__, "open_webui_base_url": server.base_url})
+        settings = type(settings)(
+            **{
+                **settings.__dict__,
+                "open_webui_base_url": server.base_url,
+                # Both candidate prefixes must be probed, otherwise the SPA case below
+                # would depend on the ambient .env
+                # 两个候选前缀都必须被探测，否则下面的 SPA 用例会受本机 .env 影响
+                "upstream_api_style": "auto",
+            }
+        )
 
         ok = store.Session(authorization=f"Bearer {VALID_TOKEN}")
         check(
@@ -459,6 +515,24 @@ def test_credentials_are_valid() -> None:
             "空凭证直接判无效",
             not asyncio.run(store._credentials_are_valid(settings, empty)),
         )
+
+        # Open WebUI's SPA answers an unknown path with 200 + HTML. That must not be read
+        # as "logged in", and it must not stop the other candidate from being tried.
+        #
+        # Open WebUI 的 SPA 会用 200 + HTML 回答未知路径：这既不能读作"已登录"，
+        # 也不应阻止继续尝试另一个候选前缀。
+        mock_module.SPA_PATHS.add("/api/v1/models")
+        try:
+            check(
+                "SPA 的 200 + HTML 不被当作鉴权成功",
+                not asyncio.run(store._credentials_are_valid(settings, expired)),
+            )
+            check(
+                "SPA 挡住首选候选后仍能在另一候选上确认有效凭证",
+                asyncio.run(store._credentials_are_valid(settings, ok)),
+            )
+        finally:
+            mock_module.SPA_PATHS.discard("/api/v1/models")
     finally:
         server.stop()
 
@@ -835,6 +909,114 @@ def test_probe_cache_store() -> None:
     old.load()
     check("旧版本缓存被忽略并重探", len(old) == 0 and old.sync_with_models([("a", "fp")]) == ["a"])
 
+    # save() must load first: the probe-heal path can save before anything loaded the
+    # cache, and that must not wipe the entries already on disk.
+    #
+    # save() 必须先 load：自愈路径可能在尚未加载缓存时就 save，这绝不能抹掉磁盘上的条目。
+    cache_file.write_text(
+        json.dumps(
+            {
+                "version": mprobe.CACHE_VERSION,
+                "models": {
+                    "kept": {
+                        "fingerprint": "fp-kept",
+                        "status": mprobe.STATUS_OK,
+                        "supported_efforts": ["none"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    never_loaded = mprobe.ModelProbeCache(cache_file)
+    never_loaded.save()
+    survived = mprobe.ModelProbeCache(cache_file)
+    survived.load()
+    check(
+        "未 load 直接 save 不会清空磁盘缓存",
+        len(survived) == 1
+        and (survived.present("kept") or {}).get("reasoning", {}).get("supported_efforts") == ["none"],
+        f"{len(survived)} 条：{cache_file.read_text(encoding='utf-8')[:160]}",
+    )
+    check(
+        "save 之后不残留临时文件",
+        not list(cache_file.parent.glob("*.tmp")),
+        str([path.name for path in cache_file.parent.iterdir()]),
+    )
+
+    dedup = mprobe.ModelProbeCache(tmp / "dedup.json")
+    check(
+        "重复的模型 id 只返回一次（不并发重复探测）",
+        dedup.sync_with_models([("dup", "fp-a"), ("dup", "fp-b"), ("dup", "fp-a")]) == ["dup"],
+        str(dedup.sync_with_models([("dup", "fp-a")])),
+    )
+
+
+def test_probe_parameter_loop() -> None:
+    print("\n--- Probe parameter loop / 探测参数循环 ---")
+    import asyncio
+
+    class _Response:
+        """The minimal httpx.Response surface _probe_model touches."""
+
+        def __init__(self, status: int, text: str):
+            self.status_code = status
+            self.text = text
+            self.is_closed = True
+
+        async def aclose(self) -> None:
+            return None
+
+    # An upstream that keeps blaming `tools` even after the proxy removed it. Without the
+    # guard this makes the loop re-send the identical request until its round budget runs
+    # out, and then report `ok` with an incomplete parameter list.
+    #
+    # 一个在 tools 被剔除后仍把 400 归咎于 tools 的上游：没有防护的话，循环会把同一发请求
+    # 重发到轮次耗尽，然后再以 ok 的状态报出一份不完整的参数列表。
+    tools_error = json.dumps(
+        {
+            "detail": '"auto" tool choice requires --enable-auto-tool-choice and '
+            "--tool-call-parser to be set"
+        }
+    )
+    sentinel_error = _literal_error(["none", "low"])
+    attempts = {"parameters": 0}
+
+    class _Upstream:
+        async def post(self, session, subpath, payload, stream=False):
+            effort = payload.get("reasoning_effort")
+            if effort == mprobe.PROBE_SENTINEL:
+                return _Response(400, sentinel_error)
+            if effort is not None:
+                return _Response(200, "{}")
+            if any(key in payload for key in mprobe.PROBED_PARAMETERS):
+                attempts["parameters"] += 1
+                return _Response(400, tools_error)
+            if isinstance((payload.get("messages") or [{}])[0].get("content"), list):
+                return _Response(
+                    200, json.dumps({"choices": [{"message": {"content": "seen"}}]})
+                )
+            return _Response(200, json.dumps({"choices": [{"message": {"content": "pong"}}]}))
+
+    original = proxy.upstream
+    proxy.upstream = _Upstream()
+    try:
+        probe = asyncio.run(proxy._probe_model(None, "m", "fp"))
+    finally:
+        proxy.upstream = original
+
+    check(
+        "归因落在已剔除的参数上时立即停止（不空转到轮次耗尽）",
+        attempts["parameters"] == 2,
+        f"参数探测请求数={attempts['parameters']}",
+    )
+    check(
+        "未得出结论的参数按未解决处理（状态 partial）",
+        probe.status == mprobe.STATUS_PARTIAL
+        and "tools" not in probe.supported_parameters,
+        f"{probe.status} {probe.supported_parameters}",
+    )
+
 
 if __name__ == "__main__":
     test_session_roundtrip()
@@ -854,6 +1036,7 @@ if __name__ == "__main__":
     test_probe_payloads()
     test_reasoning_info_derivation()
     test_probe_cache_store()
+    test_probe_parameter_loop()
 
     total = len(PASSED) + len(FAILED)
     print("\n" + "=" * 60)
@@ -863,4 +1046,4 @@ if __name__ == "__main__":
         for item in FAILED:
             print(f"  - {item}")
         sys.exit(1)
-    print("All passed / 全部通过 ✅")
+    print("All passed / 全部通过")

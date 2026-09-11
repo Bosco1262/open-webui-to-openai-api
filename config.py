@@ -15,7 +15,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -189,9 +189,23 @@ class Settings:
             return ["/api"]
         return ["/api/v1", "/api"]
 
-    def resolve_model(self, model: Optional[str]) -> Optional[str]:
-        if model is None:
-            return None
+    def resolve_model(self, model: Any) -> Any:
+        """
+        Map a client-requested model name through MODEL_ALIASES.
+
+        A malformed body may carry a non-string `model` (dict/list). Such a value has
+        no alias semantics and is not hashable either, so it is returned unchanged:
+        callers validate it and answer 400, instead of this lookup raising TypeError
+        and turning a client mistake into an HTTP 500.
+
+        用 MODEL_ALIASES 映射客户端请求的模型名。
+
+        畸形请求体可能携带非字符串的 `model`（dict/list）：它没有别名语义，也不可哈希，
+        因此原样返回——由调用方校验后以 400 拒绝，而不是在这里抛 TypeError、
+        把客户端的错误变成 HTTP 500。
+        """
+        if not isinstance(model, str):
+            return model
         return self.model_aliases.get(model, model)
 
 

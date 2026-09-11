@@ -15,12 +15,13 @@ behaviors of both upstream versions:
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 VALID_TOKEN = "mock-jwt-token"
 ERROR_MODEL = "boom-model"
@@ -34,6 +35,25 @@ ABORT_MODEL = "abort-model"
 #
 # 推理模型：响应带 reasoning_content 思考内容，用于验证代理对扩展字段无损透传
 REASONING_MODEL = "reasoning-content-model"
+# A model whose responses are gzip-compressed whenever the client accepts gzip. The
+# proxy strips the upstream's Content-Encoding, so it must forward the *decoded* body;
+# forwarding the still-compressed bytes would hand the client an unreadable response.
+#
+# 只要客户端接受 gzip，该模型的响应就带 gzip 压缩。代理会丢掉上游的 Content-Encoding，
+# 因此必须转发"已解码"的响应体；若把仍然压缩的字节直接发出去，客户端将无法解析。
+GZIP_MODEL = "gzip-model"
+# Paths answering HTTP 500, used to verify that a 5xx candidate is not mistaken for "the
+# route exists": the proxy must keep probing the other candidate prefixes.
+#
+# 返回 HTTP 500 的路径，用于验证 5xx 候选不会被当成"路由存在"：代理必须继续探测其它候选前缀。
+BROKEN_PATHS: Set[str] = set()
+# Paths answering HTTP 200 with an HTML page and no auth check at all, mimicking Open
+# WebUI's SPA answering an unknown path: a 2xx on its own must not be read as "the route
+# exists and the credentials are valid".
+#
+# 不做任何鉴权、直接返回 200 + HTML 的路径，模拟 Open WebUI 的 SPA 回答未知路径的行为：
+# 单凭 2xx 不得读作"路由存在且凭证有效"。
+SPA_PATHS: Set[str] = set()
 # Models used to verify that capabilities are established by probing the engine
 # rather than echoed from the upstream's default metadata template:
 #   * one whose engine has no tool-call parser  -> function_calling must be false;
@@ -227,6 +247,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, body: str = "<html><body>mock SPA</body></html>") -> None:
+        """
+        Answer the way Open WebUI's SPA answers an unknown path.
+
+        像 Open WebUI 的 SPA 那样回答未知路径。
+        """
+        payload = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _send_sse(self, chunks: list, delay: float = 0.02) -> None:
         # Send SSE with chunked encoding, close to a real streaming response.
         # chunked 编码发送 SSE，贴近真实流式响应。
@@ -262,6 +295,36 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _accepts_gzip(self) -> bool:
+        """
+        Whether the caller declared gzip support.
+
+        调用方是否声明支持 gzip。
+        """
+        return "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+
+    def _send_gzip(self, body: bytes, content_type: str) -> None:
+        """
+        Send a gzip-compressed response when the caller accepts gzip.
+
+        Compression stays conditional (httpx only advertises gzip when it can decode
+        it), so these tests also work with an httpx built without compression support.
+
+        调用方接受 gzip 时发送压缩响应。
+
+        压缩是有条件的（httpx 只有在能解码时才会声明 gzip），因此测试在缺少压缩支持的
+        httpx 上同样能跑。
+        """
+        compressed = self._accepts_gzip()
+        payload = gzip.compress(body) if compressed else body
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     @staticmethod
     def _authorized(headers: Any) -> bool:
         return headers.get("Authorization") == f"Bearer {VALID_TOKEN}"
@@ -282,6 +345,16 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
+        # Both handled before the auth check on purpose: a 5xx and the SPA's 200 + HTML
+        # page are exactly the answers that say nothing about the credentials.
+        #
+        # 两者刻意放在鉴权检查之前：5xx 与 SPA 的 200 + HTML 正是"对凭证不说明任何问题"的答案。
+        if path in BROKEN_PATHS:
+            self._send_json(500, {"detail": "mock upstream failure"})
+            return
+        if path in SPA_PATHS:
+            self._send_html()
+            return
         if path in ("/api/models", "/api/v1/models"):
             if not self._authorized(self.headers):
                 self._send_json(401, {"detail": "Not authenticated"})
@@ -346,6 +419,18 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/responses":
             self._send_json(200, {"id": "resp_mock", "object": "response", "model": model})
             return
+        if path in ("/api/gzipped", "/api/v1/gzipped"):
+            # A route answering with a gzip-compressed JSON body: the proxy must decode
+            # it before forwarding (see GZIP_MODEL).
+            #
+            # 用 gzip 压缩的 JSON 回答的路由：代理必须先解码再转发（见 GZIP_MODEL）。
+            self._send_gzip(
+                json.dumps(
+                    {"route": "gzipped", "model": model, "compressed": self._accepts_gzip()}
+                ).encode("utf-8"),
+                "application/json",
+            )
+            return
         if path == "/api/legacy-only":
             # A route that exists only under the legacy /api prefix, used to verify
             # prefix fallback of the catch-all passthrough
@@ -373,12 +458,50 @@ class _Handler(BaseHTTPRequestHandler):
                     return True
         return False
 
+    def _handle_gzip_chat(self, payload: Dict[str, Any], model: Optional[str]) -> None:
+        """
+        A gzip-compressed chat response, streaming or not (see GZIP_MODEL).
+
+        gzip 压缩的聊天响应，流式与非流式皆是（见 GZIP_MODEL）。
+        """
+        if payload.get("stream"):
+            chunks = [
+                'data: {"id":"chat-1","object":"chat.completion.chunk","created":1700000000,'
+                f'"model":{json.dumps(model)},"choices":[{{"index":0,"delta":{{"content":"gzip "}},"finish_reason":null}}]}}\n\n',
+                'data: {"id":"chat-1","object":"chat.completion.chunk","created":1700000000,'
+                f'"model":{json.dumps(model)},"choices":[{{"index":0,"delta":{{"content":"stream"}},"finish_reason":null}}]}}\n\n',
+                "data: [DONE]\n\n",
+            ]
+            self._send_gzip("".join(chunks).encode("utf-8"), "text/event-stream")
+            return
+        self._send_gzip(
+            json.dumps(
+                {
+                    "id": "chat-1",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "hello gzip"},
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+            "application/json",
+        )
+
     def _handle_chat(self, payload: Dict[str, Any], model: Optional[str]) -> None:
         if model == ERROR_MODEL:
             self._send_json(400, {"detail": "Model is not available"})
             return
         if model == ABORT_MODEL:
             self._send_sse_then_abort()
+            return
+        if model == GZIP_MODEL:
+            self._handle_gzip_chat(payload, model)
             return
 
         # Capability probes: this engine was built without a tool-call parser, and

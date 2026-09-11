@@ -125,6 +125,12 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Credential validation passed (upstream HTTP {status}, {desc})",
         "凭证校验通过（上游 HTTP {status}，{desc}）",
     ),
+    "startup_bad_status": (
+        "Upstream {prefix}/models answered HTTP {status}, which confirms neither the route "
+        "nor the credentials. Check the upstream service (and UPSTREAM_API_STYLE if needed).",
+        "上游 {prefix}/models 返回 HTTP {status}，既无法确认路由也无法确认凭证。"
+        "请检查上游服务（必要时再确认 UPSTREAM_API_STYLE）。",
+    ),
     "banner_start": (
         "open-webui-to-openai-api v{version} starting",
         "open-webui-to-openai-api v{version} 启动中",
@@ -173,6 +179,10 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     "err_missing_model": (
         "Missing required field: model.",
         "缺少必填字段：model。",
+    ),
+    "err_model_not_string": (
+        "Field 'model' must be a string.",
+        "字段 model 必须是字符串。",
     ),
     "err_messages_empty": (
         "messages must be a non-empty array.",
@@ -433,9 +443,19 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "上游 API 前缀探测结果：{prefix}（HTTP {status}）",
     ),
     "all_404": (
-        "All candidate prefixes returned 404 (last status {status}); falling back to {prefix}. "
-        "Make sure OPEN_WEBUI_BASE_URL points to Open WebUI, not another service.",
-        "所有候选前缀均返回 404（最后状态 {status}），回退为 {prefix}。请确认 OPEN_WEBUI_BASE_URL 指向 Open WebUI 而非其他服务。",
+        "No candidate prefix could be confirmed (last status {status}); falling back to "
+        "{prefix}. Make sure OPEN_WEBUI_BASE_URL points to Open WebUI, not another service.",
+        "所有候选前缀都未能确认（最后状态 {status}），回退为 {prefix}。请确认 OPEN_WEBUI_BASE_URL 指向 Open WebUI 而非其他服务。",
+    ),
+    "probe_unexpected": (
+        "Upstream {url} returned HTTP {status}; neither the route nor the credentials can be "
+        "confirmed, trying the next candidate prefix",
+        "上游 {url} 返回 HTTP {status}，无法确认路由与凭证，尝试下一个候选前缀",
+    ),
+    "probe_not_models": (
+        "Upstream {url} answered HTTP 200 but not with a model list (likely the SPA page for "
+        "an unknown path); trying the next candidate prefix",
+        "上游 {url} 返回 HTTP 200 但不是模型列表（很可能是 SPA 对未知路径的页面），尝试下一个候选前缀",
     ),
     "resp_fragment": (
         "Upstream response fragment: {text}",

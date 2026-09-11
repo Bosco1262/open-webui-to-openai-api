@@ -53,11 +53,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("webui-proxy.probe")
 
@@ -733,6 +734,26 @@ class ModelProbeCache:
                 self._entries[str(model_id)] = ModelProbe.from_dict(entry)
 
     def save(self) -> None:
+        """
+        Persist the cache.
+
+        `load()` runs first, so a save reached before anything loaded the file -- the
+        probe-heal path can fire before any /v1/models request, and the startup refresh
+        bails out early when there is no usable session or the model list cannot be
+        fetched -- cannot overwrite the on-disk entries with an empty in-memory state.
+
+        The write goes to a temporary file next to the cache and is then moved into
+        place, so an interrupted write cannot leave a half-written cache behind.
+
+        持久化缓存。
+
+        先执行 `load()`：若在还没有任何东西加载过缓存文件时就走到 save（自愈路径可能在
+        任何 /v1/models 请求之前触发，而启动刷新在凭证不可用或模型列表拉取失败时又会
+        提前返回），内存中的空状态就会把磁盘上已确立的条目覆盖掉。
+
+        写入先落到旁边的临时文件再原子替换，中途被打断也不会留下半截缓存。
+        """
+        self.load()
         payload = {
             "version": CACHE_VERSION,
             "models": {
@@ -740,9 +761,11 @@ class ModelProbeCache:
             },
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        temporary = self._path.with_name(self._path.name + ".tmp")
+        temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        os.replace(temporary, self._path)
 
     # ------------------------------------------------------------------ #
     # Reads
@@ -923,7 +946,8 @@ class ModelProbeCache:
         that no longer exist upstream are dropped (a disappearing model frees its
         slot; a re-added model is probed again because its entry was removed).
 
-        With force=True every current model is returned for a full re-probe.
+        With force=True every current model is returned for a full re-probe. Ids the list
+        repeats are returned once, so no model is probed twice in a single round.
 
         将缓存与当前模型列表对齐，返回仍需探测的模型 id。
 
@@ -934,13 +958,22 @@ class ModelProbeCache:
         current = {model_id for model_id, _ in models}
         for model_id in [key for key in self._entries if key not in current]:
             del self._entries[model_id]
-        if force:
-            return [model_id for model_id, _ in models]
-        return [
-            model_id
-            for model_id, fingerprint in models
-            if self.needs_probe(model_id, fingerprint, now)
-        ]
+
+        # De-duplicate by id: the upstream list may repeat a model (aggregating gateways,
+        # model-group plugins), and an id returned twice would be probed twice
+        # concurrently -- two workers, double the requests, inflated counters.
+        #
+        # 按 id 去重：上游列表可能重复同一个模型（聚合网关、模型分组插件），同一个 id 返回两次
+        # 就会并发探测两次——两个 worker、双倍请求、统计虚高。
+        pending: List[str] = []
+        seen: Set[str] = set()
+        for model_id, fingerprint in models:
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            if force or self.needs_probe(model_id, fingerprint, now):
+                pending.append(model_id)
+        return pending
 
     def __len__(self) -> int:
         return len(self._entries)

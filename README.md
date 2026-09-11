@@ -29,7 +29,7 @@ flowchart LR
 Key points:
 
 - **Credential swapping**: externally it presents your custom `PROXY_API_KEY`, while internally it swaps in the browser-captured `Authorization` / `Cookie` — the upstream never sees your proxy key.
-- **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup, and automatically falls back to the other prefix when a request returns 404 (route not found).
+- **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup — a candidate only counts when it answers with a real model list, so a 5xx or an HTML page is never mistaken for the right prefix — and automatically falls back to the other prefix when a request returns 404 (route not found).
 - **Response normalization**: `/v1/models` collapses upstream model objects into the standard `{id, object, created, owned_by}`, plus a whitelist of useful extras: `name`, `description`, `max_context_length` / `context_length` (with `max_model_len` kept as a compatibility alias) and `quantization` (parsed from the model id, e.g. `NVFP4`). Private fields (`user_id`, `access_grants`, `permission`, `urlIdx`, ...) are never exposed.
 - **Probed, not echoed**: `capabilities`, `architecture`, `supported_parameters` and `reasoning` are established by asking the engine (`/v1/models`), never copied from Open WebUI's metadata — see [Per-model probe](#per-model-probe-reasoning-efforts--capabilities). The deployment's own feature switches live in the envelope's `x_open_webui` instead, where they cannot be mistaken for model abilities.
 
@@ -37,7 +37,7 @@ Key points:
 
 - **OpenAI compatible**: `/v1/models`, `/v1/models/{id}`, `/v1/chat/completions` (including streaming SSE), `/v1/embeddings`, plus a catch-all passthrough for unimplemented `/v1/*` paths (with prefix fallback as well).
 - **Automatic upstream version adaptation**: `auto` / `v1` / `legacy` upstream API styles, with startup probing + per-request fallback.
-- **Robust streaming forwarding**: when the client disconnects, the upstream connection is closed proactively instead of hanging until timeout; hop-by-hop response headers are stripped correctly.
+- **Robust streaming forwarding**: when the client disconnects, the upstream connection is closed proactively instead of hanging until timeout; hop-by-hop response headers are stripped correctly, and a compressed upstream body (`gzip` / `deflate` / `br` / `zstd`, as supported by the HTTP stack) is decoded before it is handed to the client.
 - **OpenAI-style error bodies**: returns `{"error": {"message", "type", "code"}}` instead of FastAPI's default `{"detail": ...}`, so clients can show the error reason properly.
 - **Startup self-check**: a single `GET /models` performs both prefix probing and credential validation; dead credentials are reported immediately with a re-login hint, instead of being discovered on the first call.
 - **Optional CORS**: configure `PROXY_CORS_ORIGINS` to let browser pages call this proxy directly (preflight is answered automatically); off by default to keep the exposure surface small.
@@ -50,6 +50,7 @@ Key points:
 .
 ├── app.py                  # FastAPI routes, OpenAI compatibility layer, CLI entry
 ├── config.py               # All configuration items (env vars / .env)
+├── lang.py                 # User-facing message localization (zh / en)
 ├── model_probe.py          # Per-model probe: error parsing, probe payloads, cache
 ├── session_store.py        # Credential load/save + Playwright browser login capture
 ├── upstream.py             # Upstream forwarding: connection pool, prefix probing, streaming
@@ -351,15 +352,15 @@ request. A failed re-probe never discards facts established earlier.
 
 ```json
 {
-  "Authorization": "Bearer eyJhbGciOiJIUzI1NiIs...",
-  "Cookie": "",
-  "User-Agent": "Mozilla/5.0 ...",
+  "authorization": "Bearer eyJhbGciOiJIUzI1NiIs...",
+  "cookie": "",
+  "user_agent": "Mozilla/5.0 ...",
   "captured_at": 1756000000.0,
   "base_url": "https://your-open-webui-domain.com"
 }
 ```
 
-At least one of `Authorization` and `Cookie` must be present. If you can grab the Open WebUI JWT from the browser DevTools (F12), you can also **write this file by hand** and skip the browser login entirely.
+At least one of `authorization` and `cookie` must be present. Keys are matched case-insensitively (and `user_agent` / `User-Agent` are both accepted), so the capitalized form written by older versions keeps working. If you can grab the Open WebUI JWT from the browser DevTools (F12), you can also **write this file by hand** and skip the browser login entirely.
 
 > `session.json` is already listed in `.gitignore` — never commit it. On POSIX systems it is written with `600` permissions automatically.
 
@@ -376,7 +377,7 @@ python tests/test_smoke.py    # End-to-end: mock upstream + real proxy startup
 
 `test_units.py` covers: credential serialization and legacy-format compatibility, login-signal detection, model-list normalization, config-parsing tolerance, error response shape.
 
-`test_smoke.py` covers: health check, auth rejection, model-list normalization, non-streaming/streaming chat, upstream error passthrough, parameter validation, embeddings, catch-all passthrough, and 503 when credentials are missing — each run against all three upstream styles (`auto` / `v1` / `legacy`).
+`test_smoke.py` covers: health check, auth rejection, model-list normalization, non-streaming/streaming chat, upstream error passthrough, parameter validation, embeddings, catch-all passthrough, gzip-compressed upstream responses, prefix fallback when the primary candidate answers 5xx, and 503 when credentials are missing — each run against all three upstream styles (`auto` / `v1` / `legacy`).
 
 ## Troubleshooting
 
@@ -396,7 +397,7 @@ Open WebUI's JWT has a limited lifetime (controlled by the server-side `JWT_EXPI
 python app.py --login
 ```
 
-**Q: Every request returns 404, logs say "all candidate prefixes returned 404"**
+**Q: Every request returns 404, logs say "no candidate prefix could be confirmed"**
 
 `OPEN_WEBUI_BASE_URL` may not point to an Open WebUI instance (e.g. it was set to an Ollama address), or the upstream version is very old. Run `python app.py --check` first to see the probe result, and if necessary set `UPSTREAM_API_STYLE=legacy` explicitly.
 

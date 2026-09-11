@@ -25,9 +25,23 @@ import httpx
 
 import lang
 from config import Settings
-from session_store import Session
+from session_store import Session, looks_like_model_list
 
 logger = logging.getLogger("webui-proxy.upstream")
+
+# Upstream statuses meaning "this route exists; the credentials are the problem"
+# 表示"该路由存在，问题出在凭证"的上游状态码
+AUTH_FAILURE_CODES = (401, 403)
+
+# The instance-metadata fetch (/api/config) is a bonus, never a requirement: it must not
+# be able to hold /v1/models hostage for REQUEST_TIMEOUT seconds when the upstream
+# half-dies (TCP established, no answer). `_ensure_instance_meta` keeps the previous
+# snapshot on failure, so a short timeout is enough.
+#
+# 实例元信息请求（/api/config）只是附加项，绝不是必需项：上游半死（TCP 已建立但不回包）时
+# 它不能把 /v1/models 拖住 REQUEST_TIMEOUT 秒。失败时 `_ensure_instance_meta` 会沿用上一份
+# 快照，因此短超时足够。
+INSTANCE_META_TIMEOUT = 5.0
 
 # Hop-by-hop headers that must not be passed from the upstream response to the client
 # 需要逐跳处理、不能从上游响应直接透传给客户端的响应头
@@ -41,6 +55,11 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
     "content-length",
+    # The body is forwarded in its decoded form (httpx decodes gzip/deflate/br/zstd on
+    # the way out), so the upstream's Content-Encoding must not be passed on.
+    #
+    # 响应体是按"已解码"的形式转发的（httpx 会解码 gzip/deflate/br/zstd），
+    # 因此上游的 Content-Encoding 不能透传。
     "content-encoding",
     # Content-Type is set by StreamingResponse's media_type to avoid duplication
     # Content-Type 由 StreamingResponse 的 media_type 负责设置，避免重复
@@ -115,16 +134,28 @@ class UpstreamClient:
         """
         Probe for a usable prefix; return (prefix, HTTP status of the probe request).
 
-        The probe request itself is an authenticated GET /models, so its status code
-        also tells whether the credentials are valid -- the startup self-check
-        (_startup_check / --check) uses this to merge "find the prefix + validate the
-        credentials" into a single request instead of hitting /models twice.
+        A candidate only counts as the upstream prefix when its answer is conclusive:
+
+        * 2xx whose body really is a model list -- the route exists and the credentials
+          work;
+        * 401/403 -- the route exists and the credentials are dead.
+
+        Everything else says nothing about either question, so the next candidate is
+        tried instead: 404 (no such route), 5xx (the upstream is unwell), and the SPA's
+        HTTP 200 + HTML page for an unknown path. The returned status is therefore
+        meaningful to the startup self-check (_startup_check / --check), which merges
+        "find the prefix + validate the credentials" into this single request.
 
         探测可用前缀，返回 (前缀, 探测请求的 HTTP 状态码)。
 
-        探测请求本身就是一次带凭证的 GET /models，状态码因此同时能用于
-        判断凭证是否有效——启动自检（_startup_check / --check）据此把
-        "找前缀 + 验凭证"合并为一次请求，不再对 /models 打两次。
+        只有结论性的回答才算数：
+
+        * 2xx 且响应体确实是模型列表——路由存在且凭证有效；
+        * 401/403——路由存在但凭证失效。
+
+        其它回答对这两个问题都不说明什么，因此换下一个候选前缀再试：404（无此路由）、
+        5xx（上游不健康）、以及 SPA 对未知路径回的 HTTP 200 + HTML 页面。返回的状态码因此
+        对启动自检（_startup_check / --check）有意义：它把"找前缀 + 验凭证"合并为这一次请求。
         """
         candidates: List[str] = self.settings.prefix_candidates()
         client = await self.client()
@@ -138,21 +169,33 @@ class UpstreamClient:
             except httpx.RequestError as exc:
                 raise UpstreamUnavailable(lang.t("unavailable_connect", url=url, exc=exc)) from exc
 
-            if resp.status_code == 404:
-                last_status, last_text = resp.status_code, resp.text[:200]
-                logger.debug(lang.t("probe_404", url=url))
+            status = resp.status_code
+            if status in AUTH_FAILURE_CODES or (
+                200 <= status < 300 and looks_like_model_list(resp)
+            ):
+                self.prefix = prefix
+                logger.info(lang.t("probe_result", prefix=prefix, status=status))
                 await resp.aclose()
-                continue
+                return prefix, status
 
-            self.prefix = prefix
-            logger.info(lang.t("probe_result", prefix=prefix, status=resp.status_code))
+            last_status, last_text = status, resp.text[:200]
+            if status == 404:
+                logger.debug(lang.t("probe_404", url=url))
+            elif 200 <= status < 300:
+                # HTTP 200 + HTML: Open WebUI's SPA answers unknown paths with a page,
+                # which is not an API route at all -- a 5xx-free status is not proof.
+                #
+                # HTTP 200 + HTML：Open WebUI 的 SPA 会用一页 HTML 回答未知路径，
+                # 那根本不是 API 路由——状态码不带 5xx 并不构成证据。
+                logger.debug(lang.t("probe_not_models", url=url))
+            else:
+                logger.warning(lang.t("probe_unexpected", url=url, status=status))
             await resp.aclose()
-            return prefix, resp.status_code
 
-        # All candidates returned 404: fall back to the first candidate so the upper
+        # No candidate could be confirmed: fall back to the first candidate so the upper
         # layer gets a real error
         #
-        # 所有候选都 404：兜底用第一个候选，让上层拿到真实错误
+        # 没有候选能被确认：兜底用第一个候选，让上层拿到真实错误
         self.prefix = candidates[0]
         logger.warning(
             lang.t("all_404", status=last_status, prefix=self.prefix),
@@ -194,7 +237,9 @@ class UpstreamClient:
         url = self.settings.upstream_url("/api", "config")
         client = await self.client()
         try:
-            response = await client.get(url, headers=session.to_headers())
+            response = await client.get(
+                url, headers=session.to_headers(), timeout=INSTANCE_META_TIMEOUT
+            )
         except httpx.RequestError as exc:
             logger.debug(lang.t("instance_meta_failed", exc=exc))
             return None

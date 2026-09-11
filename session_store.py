@@ -19,7 +19,7 @@ import os
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -50,6 +50,35 @@ AUTHED_PATH_HINTS = (
     "/api/folders",
     "/api/knowledge",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Upstream response shape
+# 上游响应形态
+# --------------------------------------------------------------------------- #
+def looks_like_model_list(response: httpx.Response) -> bool:
+    """
+    Whether a 2xx /models answer really is the model list.
+
+    Open WebUI's SPA answers unknown paths with HTTP 200 and an HTML page, so a 2xx on
+    its own proves neither that the route exists nor that the credentials are valid.
+    Both callers -- the prefix probe (upstream.probe_prefix) and the browser-login
+    validation (see _credentials_are_valid) -- must therefore look at the body, not
+    just the status code.
+
+    2xx 的 /models 回答是否真的是模型列表。
+
+    Open WebUI 的 SPA 会用 HTTP 200 + 一页 HTML 回答未知路径，因此单凭 2xx 既不能证明
+    路由存在，也不能证明凭证有效。两个调用方——前缀探测（upstream.probe_prefix）与
+    浏览器登录校验（见 _credentials_are_valid）——都必须看响应体，而不是只看状态码。
+    """
+    if "html" in response.headers.get("content-type", "").lower():
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, (dict, list))
 
 
 class SessionError(RuntimeError):
@@ -173,24 +202,53 @@ def session_exists(settings: Settings) -> bool:
     return settings.session_file.exists()
 
 
+# Parsed session.json, keyed by path -> (mtime_ns, size, Session). load_session() runs on
+# every request (via app._session_or_error), so re-reading and re-parsing the file each
+# time is pure waste; the stat check keeps an externally replaced file -- a re-login from
+# another process, a hand-edited session.json -- visible. Failures are never cached.
+#
+# 已解析的 session.json，键为路径 -> (mtime_ns, size, Session)。load_session() 每个请求都会
+# 被调用（经 app._session_or_error），每次重新读盘解析纯属浪费；stat 检查保证被外部替换的
+# 文件（另一进程重新登录、手工编辑 session.json）依然可见。失败结果一律不缓存。
+_session_cache: Dict[str, Tuple[int, int, Session]] = {}
+
+
+def _invalidate_session_cache(settings: Settings) -> None:
+    """Drop the cached parse of the credential file. / 丢弃凭证文件的解析缓存。"""
+    _session_cache.pop(str(settings.session_file), None)
+
+
 def load_session(settings: Settings) -> Session:
     path: Path = settings.session_file
-    if not path.exists():
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        _invalidate_session_cache(settings)
         raise SessionMissing(
             lang.t("session_missing_file", path=path)
-        )
+        ) from exc
+
+    key = str(path)
+    cached = _session_cache.get(key)
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
+        _invalidate_session_cache(settings)
         raise SessionInvalid(lang.t("session_unparseable", path=path, exc=exc)) from exc
     if not isinstance(raw, dict):
+        _invalidate_session_cache(settings)
         raise SessionInvalid(lang.t("session_wrong_shape", path=path))
 
     session = Session.from_dict(raw)
     if not session.is_usable():
+        _invalidate_session_cache(settings)
         raise SessionInvalid(
             lang.t("session_no_creds", path=path)
         )
+    _session_cache[key] = (stat.st_mtime_ns, stat.st_size, session)
     return session
 
 
@@ -198,6 +256,11 @@ def save_session(settings: Settings, session: Session) -> None:
     path: Path = settings.session_file
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    # Do not rely on the stat check alone: the caller may immediately read the file back
+    # within the filesystem's mtime granularity.
+    #
+    # 不只依赖 stat 检查：调用方可能在文件系统的 mtime 粒度内立刻回读该文件。
+    _invalidate_session_cache(settings)
     # Tighten permissions on POSIX so other users on the same machine cannot read the credentials
     # POSIX 下收敛权限，避免凭证被同机其他用户读取
     if os.name == "posix":
@@ -284,7 +347,9 @@ async def _credentials_are_valid(settings: Settings, session: Session) -> bool:
 
     Therefore credentials only count as valid if they pass one real upstream
     authentication: 401/403 (invalid/expired), 3xx (redirected by a portal), and
-    network errors are all judged invalid; 404 means trying the next candidate prefix.
+    network errors are all judged invalid; 404 means trying the next candidate prefix;
+    and a 2xx whose body is not the model list (the SPA's 200 + HTML page for an
+    unknown path) proves nothing either, so that also moves on to the next candidate.
 
     对上游做一次真实请求，校验抓到的凭证当前是否有效。
 
@@ -294,7 +359,9 @@ async def _credentials_are_valid(settings: Settings, session: Session) -> bool:
       网关重定向到认证页——此时抓到的只是"重定向前"的旧请求头。
 
     因此凭证必须通过上游一次真实鉴权才算有效：401/403（无效/过期）、
-    3xx（被门户重定向）、网络错误一律判无效；404 则换下一个候选前缀再试。
+    3xx（被门户重定向）、网络错误一律判无效；404 换下一个候选前缀再试；
+    响应体不是模型列表的 2xx（未知路径被 SPA 用 200 + HTML 回答）同样证明不了什么，
+    也换下一个候选。
     """
     if not session.is_usable():
         return False
@@ -315,7 +382,11 @@ async def _credentials_are_valid(settings: Settings, session: Session) -> bool:
                 return False
             if resp.status_code == 404:
                 continue
-            return 200 <= resp.status_code < 300
+            if not (200 <= resp.status_code < 300):
+                return False
+            if not looks_like_model_list(resp):
+                continue
+            return True
     return False
 
 

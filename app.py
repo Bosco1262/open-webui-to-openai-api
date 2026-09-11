@@ -77,15 +77,11 @@ from model_probe import (
     response_has_reasoning,
     vision_payload,
 )
-from upstream import UpstreamClient, UpstreamUnavailable
+from upstream import AUTH_FAILURE_CODES, UpstreamClient, UpstreamUnavailable
 
 logger = logging.getLogger("webui-proxy")
 
 VERSION = "1.0.0"
-
-# The upstream returning these status codes means the credentials are dead and re-login is needed
-# 上游返回这几个状态码说明凭证失效，需要重新登录
-AUTH_FAILURE_CODES = (401, 403)
 
 
 def configure_logging(current: Settings) -> None:
@@ -162,6 +158,18 @@ async def _startup_check() -> bool:
         logger.error(
             lang.t("models_404", prefix=prefix)
         )
+        return False
+
+    if not 200 <= status < 300:
+        # probe_prefix only accepts 2xx (with a real model list) and 401/403 as
+        # conclusive, so anything reaching here means no candidate could be confirmed
+        # (5xx, or a 200 that is not the model list). Reporting that as "credentials
+        # valid" would be a claim nothing supports.
+        #
+        # probe_prefix 只把 2xx（且响应体确实是模型列表）与 401/403 当作结论，因此走到这里
+        # 说明没有任何候选能被确认（5xx，或 200 但不是模型列表）。把它报成"凭证校验通过"
+        # 是没有任何依据的结论。
+        logger.error(lang.t("startup_bad_status", prefix=prefix, status=status))
         return False
 
     logger.info(lang.t("creds_ok", status=status, desc=session.describe()))
@@ -368,9 +376,25 @@ async def _probe_model(session: Any, model_id: str, fingerprint: str) -> ModelPr
             # 这个 400 无法归因到某个参数：对仍在测试的参数不做任何声明，而不是猜。
             unresolved += 1
             break
+        if not blamed_set & set(remaining):
+            # The blame landed on a parameter that is no longer under test (typically one
+            # already disproved in an earlier round). Claim nothing and stop, instead of
+            # re-sending the very same request until the round budget runs out.
+            #
+            # 归因落在已不在测试范围内的参数上（通常是上一轮已被证伪的那个）：不做任何声明
+            # 并立即停止，而不是把同一发请求重发到轮次耗尽。
+            unresolved += 1
+            break
         for parameter in blamed_set & set(remaining):
             parameter_accepted[parameter] = False
         remaining = [item for item in remaining if item not in blamed_set]
+
+    if remaining:
+        # Defensive invariant: should the loop ever end with parameters still undecided,
+        # the probe must not claim they were established.
+        #
+        # 防御性不变式：循环若在仍有参数未定性的情况下结束，探测不得声称它们已确立。
+        unresolved += 1
 
     # --- 4. vision: does the engine accept image content at all? ----------------
     response = await ask(vision_payload(model_id))
@@ -696,7 +720,54 @@ def _describe_probe(probe: ModelProbe) -> str:
     return "; ".join(parts)
 
 
+# A refresh must not run concurrently with itself: the heal path can fire while a
+# startup / /v1/models refresh is still in flight, and two instances would probe the same
+# models twice, interleave `_refresh_state.pending`, and make each other's backoff
+# counters drift. The lock also makes "one refresh at a time" hold for the --probe CLI
+# path.
+#
+# 刷新不得与自身并发：自愈可能在启动 / `/v1/models` 触发的刷新仍在飞行时触发，两个实例会
+# 重复探测同一批模型、交错改写 `_refresh_state.pending`，并让双方的退避计数漂移。
+# 这把锁同时让 `--probe` CLI 路径也遵守"同一时刻至多一个刷新"。
+_refresh_lock: Optional[asyncio.Lock] = None
+
+
+def _refresh_mutex() -> asyncio.Lock:
+    """
+    The refresh mutex, created lazily on first use.
+
+    asyncio primitives bind to the event loop they are first used in, so a Lock built at
+    import time could belong to a loop that `asyncio.run()` (--check / --probe) or
+    uvicorn never uses -- and on Python 3.9 that binding happens even earlier. Creating
+    it on first use always yields a lock of the current loop.
+
+    刷新互斥锁，首次使用时惰性创建。
+
+    asyncio 原语会绑定到首次使用它的事件循环，因此在 import 期构造的锁可能属于一个
+    `asyncio.run()`（--check / --probe）或 uvicorn 都不会使用的循环——在 Python 3.9 上
+    这种绑定甚至发生得更早。首次使用时创建，拿到的总是当前循环的锁。
+    """
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
+
+
 async def _refresh_model_probe(
+    *,
+    summaries: Optional[List[Tuple[str, str]]] = None,
+    force: bool = False,
+) -> bool:
+    """
+    Serialize cache refreshes; the actual work is in _refresh_model_probe_locked.
+
+    串行化缓存刷新；实际工作见 _refresh_model_probe_locked。
+    """
+    async with _refresh_mutex():
+        return await _refresh_model_probe_locked(summaries=summaries, force=force)
+
+
+async def _refresh_model_probe_locked(
     *,
     summaries: Optional[List[Tuple[str, str]]] = None,
     force: bool = False,
@@ -1443,11 +1514,17 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
             )
 
     media_type = resp.headers.get("content-type", "text/event-stream")
+    # Only the headers this proxy really owns are added. Connection and friends are
+    # hop-by-hop and stay the protocol layer's business (uvicorn decides on reuse);
+    # stripping them from the upstream response only to re-add one here would be
+    # self-contradictory.
+    #
+    # 只补上本代理真正拥有的头。Connection 之类的逐跳头属于协议层（是否复用由 uvicorn 决定），
+    # 从上游响应里剔除却又在这里加回来，属于自相矛盾。
     headers = UpstreamClient.forward_headers(
         resp,
         {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
@@ -1463,11 +1540,18 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
 async def embeddings(request: Request, _: None = Depends(require_proxy_key)) -> Response:
     session = _session_or_error()
     payload = await _read_json_body(request)
-    if not payload.get("model") or "input" not in payload:
+    model = payload.get("model")
+    if not model or (isinstance(model, str) and not model.strip()) or "input" not in payload:
         return openai_error(
             lang.t("err_missing_model_input"), 400, code="missing_required_field"
         )
-    payload["model"] = settings.resolve_model(payload.get("model"))
+    # Same guard as chat/completions: a non-string model must not reach resolve_model.
+    # 与 chat/completions 相同的防护：非字符串的 model 不得进入 resolve_model。
+    if not isinstance(model, str):
+        return openai_error(
+            lang.t("err_model_not_string"), 400, code="invalid_type", param="model"
+        )
+    payload["model"] = settings.resolve_model(model)
 
     try:
         resp = await upstream.post(session, "embeddings", payload, stream=False)
@@ -1575,8 +1659,17 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
 
 
 def _validate_chat_payload(payload: Dict[str, Any]) -> None:
-    if not payload.get("model"):
+    model = payload.get("model")
+    if not model or (isinstance(model, str) and not model.strip()):
         raise _http_error(400, lang.t("err_missing_model"), code="missing_required_field", param="model")
+    # A non-string model (a malformed body may carry a dict/list) must be rejected here:
+    # it has no alias semantics and is not hashable, so it would otherwise blow up in
+    # resolve_model as a TypeError -> HTTP 500.
+    #
+    # 非字符串的 model（畸形请求体里可能是 dict/list）必须在这里拦下：它没有别名语义、
+    # 也不可哈希，否则会在 resolve_model 里抛 TypeError，变成 HTTP 500。
+    if not isinstance(model, str):
+        raise _http_error(400, lang.t("err_model_not_string"), code="invalid_type", param="model")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise _http_error(400, lang.t("err_messages_empty"), code="missing_required_field", param="messages")
@@ -1610,7 +1703,17 @@ async def _sse_iterator(resp: httpx.Response, request: Request):
     客户端连已经收到的部分内容都拿不到，服务端还会留下一大串 traceback。
     """
     try:
-        async for chunk in resp.aiter_raw():
+        # aiter_bytes() rather than aiter_raw(): httpx advertises gzip/deflate/br/zstd
+        # and decodes them here, which is exactly what forward_headers promises when it
+        # drops the upstream's Content-Encoding. Forwarding the raw bytes while
+        # stripping that header would hand the client a compressed body it cannot
+        # decode -- and /v1/* passthrough JSON is routinely compressed upstream.
+        #
+        # 用 aiter_bytes() 而不是 aiter_raw()：httpx 会自动协商并在此解码
+        # gzip/deflate/br/zstd，这正是 forward_headers 丢弃上游 Content-Encoding 时
+        # 所承诺的。若一边丢掉该头、一边转发未解码的原始字节，客户端拿到的响应将无法
+        # 解析——而 /v1/* 兜底透传的 JSON 在上游通常就是被压缩的。
+        async for chunk in resp.aiter_bytes():
             if not chunk:
                 continue
             if await request.is_disconnected():

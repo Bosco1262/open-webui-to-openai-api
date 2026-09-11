@@ -29,7 +29,7 @@ flowchart LR
 关键点：
 
 - **凭证替换**：对外用你自定义的 `PROXY_API_KEY`，对内替换成浏览器抓来的 `Authorization` / `Cookie`，上游永远看不到你的 Proxy Key。
-- **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀，请求返回 404（路由不存在）时还会自动回退到另一个前缀。
+- **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀——候选前缀必须返回真正的模型列表，因此 5xx 或一页 HTML 不会被误认为正确前缀——请求返回 404（路由不存在）时还会自动回退到另一个前缀。
 - **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按白名单透出有用的扩展字段：`name`、`description`、`max_context_length` / `context_length`（`max_model_len` 作为兼容别名保留）、`quantization`（从模型名解析，如 `NVFP4`）；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
 - **实证而非照抄**：`capabilities`、`architecture`、`supported_parameters`、`reasoning` 全部通过向引擎发请求得出（见[逐模型探测](#逐模型探测思考挡位与能力)），绝不照抄 Open WebUI 的元数据；部署自身的功能开关改放信封的 `x_open_webui`，不会被误读成模型能力。
 
@@ -37,7 +37,7 @@ flowchart LR
 
 - **OpenAI 兼容**：`/v1/models`、`/v1/models/{id}`、`/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`，以及未实现路径的 `/v1/*` 兜底透传（同样具备前缀回退）。
 - **自动适配上游版本**：`auto` / `v1` / `legacy` 三种上游 API 风格，启动探测 + 请求级回退。
-- **健壮的流式转发**：客户端断开时主动关闭上游连接，不会把连接挂到超时；正确剔除逐跳响应头。
+- **健壮的流式转发**：客户端断开时主动关闭上游连接，不会把连接挂到超时；正确剔除逐跳响应头；上游启用压缩时（`gzip` / `deflate` / `br` / `zstd`，取决于 HTTP 库支持），先解码再交给客户端。
 - **OpenAI 风格错误体**：返回 `{"error": {"message", "type", "code"}}`，而不是 FastAPI 默认的 `{"detail": ...}`，客户端能正常显示错误原因。
 - **启动自检**：一次 `GET /models` 同时完成前缀探测与凭证校验，失效会直接提示重新登录，不用等第一次调用才发现问题。
 - **可选 CORS**：配置 `PROXY_CORS_ORIGINS` 后浏览器页面可以直连本代理（预检自动应答）；默认关闭，不扩大暴露面。
@@ -50,6 +50,7 @@ flowchart LR
 .
 ├── app.py                  # FastAPI 路由、OpenAI 兼容层、CLI 入口
 ├── config.py               # 全部配置项（环境变量 / .env）
+├── lang.py                 # 用户可见消息本地化（zh / en）
 ├── model_probe.py          # 逐模型探测：报错解析、探测载荷、缓存
 ├── session_store.py        # 凭证读写 + Playwright 浏览器登录抓取
 ├── upstream.py             # 上游转发：连接池、前缀探测、流式
@@ -342,15 +343,15 @@ Open WebUI 会给每个模型上报 `info.meta.capabilities`，但那是它的**
 
 ```json
 {
-  "Authorization": "Bearer eyJhbGciOiJIUzI1NiIs...",
-  "Cookie": "",
-  "User-Agent": "Mozilla/5.0 ...",
+  "authorization": "Bearer eyJhbGciOiJIUzI1NiIs...",
+  "cookie": "",
+  "user_agent": "Mozilla/5.0 ...",
   "captured_at": 1756000000.0,
   "base_url": "https://your-open-webui-domain.com"
 }
 ```
 
-`Authorization` 与 `Cookie` 至少要有其一。如果你能从浏览器 F12 里拿到 Open WebUI 的 JWT，也可以**手写这个文件**，完全跳过浏览器登录这一步。
+`authorization` 与 `cookie` 至少要有其一。键名大小写不敏感（`user_agent` / `User-Agent` 都接受），因此早期版本写入的大写形式依然可用。如果你能从浏览器 F12 里拿到 Open WebUI 的 JWT，也可以**手写这个文件**，完全跳过浏览器登录这一步。
 
 > `session.json` 已在 `.gitignore` 中，切勿提交。POSIX 系统下写入时会自动收敛为 `600` 权限。
 
@@ -367,7 +368,7 @@ python tests/test_smoke.py    # 端到端：拉起 mock 上游 + 真实启动本
 
 `test_units.py` 覆盖：凭证序列化与旧格式兼容、登录信号判定、模型列表规范化、配置解析容错、错误响应结构。
 
-`test_smoke.py` 覆盖：健康检查、鉴权拒绝、模型列表规范化、非流式/流式对话、上游错误透传、参数校验、embeddings、兜底透传、凭证缺失时的 503；并对 `auto` / `v1` / `legacy` 三种上游风格各跑一遍。
+`test_smoke.py` 覆盖：健康检查、鉴权拒绝、模型列表规范化、非流式/流式对话、上游错误透传、参数校验、embeddings、兜底透传、上游 gzip 压缩响应、主候选 5xx 时的前缀回退、凭证缺失时的 503；并对 `auto` / `v1` / `legacy` 三种上游风格各跑一遍。
 
 ## 故障排除
 
@@ -387,7 +388,7 @@ Open WebUI 的 JWT 有有效期（默认由服务端的 `JWT_EXPIRES_IN` 控制�
 python app.py --login
 ```
 
-**Q: 所有请求都 404，日志提示"所有候选前缀均返回 404"**
+**Q: 所有请求都 404，日志提示"所有候选前缀都未能确认"**
 
 `OPEN_WEBUI_BASE_URL` 可能没指向 Open WebUI（例如填成了 Ollama 的地址），或者上游版本非常旧。先用 `python app.py --check` 看探测结果，必要时显式设 `UPSTREAM_API_STYLE=legacy`。
 

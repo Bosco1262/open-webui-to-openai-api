@@ -29,13 +29,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mock_openwebui import (  # noqa: E402
     ABORT_MODEL,
+    BROKEN_PATHS,
     ERROR_MODEL,
+    GZIP_MODEL,
     MODELS,
     NO_TOOLS_MODEL,
     REASONING_MODEL,
     TEXT_ONLY_MODEL,
     VALID_TOKEN,
 )
+
+# A Windows console whose code page cannot represent every character the script prints
+# (cp936 here) would otherwise abort the run with UnicodeEncodeError *after* the last
+# check, reporting a failure that never happened.
+#
+# 在无法表示全部输出字符的 Windows 控制台（此处 cp936）上，若不做处理，脚本会在最后一个
+# 检查之后抛 UnicodeEncodeError 中止，报告一个并不存在的失败。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
 
 PROXY_KEY = "sk-test-proxy-key"
 PASSED: list = []
@@ -366,6 +377,29 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         )
         check(f"[{style}] 非法 JSON 返回 400", resp.status_code == 400, resp.text[:200])
 
+        # A non-string model must be answered 400, never 500: the MODEL_ALIASES lookup
+        # raises TypeError on an unhashable value.
+        #
+        # 非字符串的 model 必须得到 400 而不是 500：别名映射对不可哈希的值会抛 TypeError。
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={"model": {"not": "a string"}, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            f"[{style}] model 非字符串返回 400（不是 500）",
+            resp.status_code == 400 and resp.json().get("error", {}).get("code") == "invalid_type",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        resp = client.post(
+            "/v1/embeddings", headers=headers(), json={"model": ["a"], "input": ["hello"]}
+        )
+        check(
+            f"[{style}] embeddings 的 model 非字符串返回 400",
+            resp.status_code == 400 and resp.json().get("error", {}).get("code") == "invalid_type",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+
         # 8. Upstream stream cut mid-way: must not surface as 500, and content already
         #    received must be preserved
         #
@@ -433,6 +467,76 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
                 resp.status_code == 200 and resp.json().get("route") == "legacy-only",
                 resp.text[:200],
             )
+
+        # 10. Upstream compression: the proxy drops Content-Encoding, so it must forward
+        #     the *decoded* body -- httpx advertises gzip by default, and a gzipped body
+        #     forwarded raw would be unreadable for the client.
+        #
+        # 10. 上游压缩：代理会丢掉 Content-Encoding，因此必须转发已解码的响应体——
+        #     httpx 默认声明接受 gzip，把压缩字节原样转发会让客户端无法解析。
+        gzip_passthrough_ok = False
+        try:
+            resp = client.post("/v1/gzipped", headers=headers(), json={"model": "llama3:latest"})
+            payload = resp.json() or {}
+            gzip_passthrough_ok = resp.status_code == 200 and payload.get("route") == "gzipped"
+            gzip_passthrough_detail = (
+                f"{resp.status_code} upstream_compressed={payload.get('compressed')} "
+                f"content-encoding={resp.headers.get('content-encoding')!r} {resp.content[:24]!r}"
+            )
+        except Exception as exc:
+            gzip_passthrough_detail = f"{type(exc).__name__}: {exc}"
+        check(
+            f"[{style}] 上游 gzip 的透传响应解码后可解析",
+            gzip_passthrough_ok,
+            gzip_passthrough_detail,
+        )
+
+        gzip_chat_ok = False
+        try:
+            resp = client.post(
+                "/v1/chat/completions",
+                headers=headers(),
+                json={"model": GZIP_MODEL, "messages": [{"role": "user", "content": "hi"}]},
+            )
+            gzip_chat_ok = (
+                resp.status_code == 200
+                and (resp.json() or {}).get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+                == "hello gzip"
+            )
+            gzip_chat_detail = f"{resp.status_code} {resp.content[:40]!r}"
+        except Exception as exc:
+            gzip_chat_detail = f"{type(exc).__name__}: {exc}"
+        check(
+            f"[{style}] 上游 gzip 的非流式对话解码后可解析",
+            gzip_chat_ok,
+            gzip_chat_detail,
+        )
+
+        gzip_stream_text = ""
+        try:
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=headers(),
+                json={
+                    "model": GZIP_MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            ) as stream:
+                for line in stream.iter_lines():
+                    gzip_stream_text += line + "\n"
+        except Exception as exc:
+            gzip_stream_text = f"{type(exc).__name__}: {exc}"
+        check(
+            f"[{style}] 上游 gzip 的流式对话解码后可读",
+            "[DONE]" in gzip_stream_text
+            and '"content":"gzip "' in gzip_stream_text
+            and '"content":"stream"' in gzip_stream_text,
+            gzip_stream_text[:200],
+        )
 
         client.close()
     finally:
@@ -565,6 +669,47 @@ def run_cors_case(server_url: str) -> None:
 
         client.close()
     finally:
+        proxy.stop()
+
+
+def run_prefix_5xx_case(server_url: str) -> None:
+    print("\n=== Scenario: primary prefix returns 5xx / 场景：主候选前缀返回 5xx ===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json")
+    # Make the first candidate (/api/v1) fail with a 5xx while the legacy /api stays
+    # healthy: the proxy must not settle on a prefix it could not confirm, otherwise
+    # every request dies on a 502 (the fallback only kicks in on 404).
+    #
+    # 让首候选（/api/v1）返回 5xx、旧版 /api 保持健康：代理不得停在一个无法确认的前缀上，
+    # 否则每个请求都会以 502 失败（回退只对 404 生效）。
+    BROKEN_PATHS.add("/api/v1/models")
+    proxy = ProxyProcess(server_url, session_file, "auto")
+    try:
+        if not proxy.wait():
+            check("[5xx] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+
+        body = client.get("/healthz", headers=headers()).json() or {}
+        check(
+            "[5xx] 5xx 候选不被当作可用前缀（回退到 /api）",
+            body.get("upstream_prefix") == "/api",
+            str(body),
+        )
+
+        resp = client.get("/v1/models", headers=headers())
+        try:
+            data = (resp.json() or {}).get("data") or []
+            fallback_ok = resp.status_code == 200 and len(data) == len(MODELS["data"])
+            fallback_detail = f"{resp.status_code} models={len(data)}"
+        except Exception as exc:
+            fallback_ok = False
+            fallback_detail = f"{type(exc).__name__}: {exc} {resp.text[:120]}"
+        check("[5xx] 回退前缀下 /v1/models 依然可用", fallback_ok, fallback_detail)
+
+        client.close()
+    finally:
+        BROKEN_PATHS.discard("/api/v1/models")
         proxy.stop()
 
 
@@ -770,6 +915,7 @@ def main() -> int:
         run_case(server.base_url, "legacy", "/api")
         run_missing_session_case(server.base_url)
         run_cors_case(server.base_url)
+        run_prefix_5xx_case(server.base_url)
         run_probe_case(server.base_url)
     finally:
         server.stop()
@@ -782,7 +928,7 @@ def main() -> int:
         for item in FAILED:
             print(f"  - {item}")
         return 1
-    print("All passed / 全部通过 ✅")
+    print("All passed / 全部通过")
     return 0
 
 

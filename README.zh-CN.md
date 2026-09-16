@@ -4,7 +4,7 @@
 
 把只能通过网页登录访问的 **Open WebUI** 实例，反向代理成 **兼容 OpenAI 协议** 的 API，让任何 OpenAI 客户端都能直接连上。
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -29,13 +29,13 @@ flowchart LR
 关键点：
 
 - **凭证替换**：对外用你自定义的 `PROXY_API_KEY`，对内替换成浏览器抓来的 `Authorization` / `Cookie`，上游永远看不到你的 Proxy Key。
-- **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀——候选前缀必须返回真正的模型列表，因此 5xx 或一页 HTML 不会被误认为正确前缀——请求返回 404（路由不存在）时还会自动回退到另一个前缀。
+- **协议对齐**：上游 Open WebUI ≥ 0.6 已提供 OpenAI 兼容路由 `/api/v1/*`，旧版本只有内部路由 `/api/*`。本项目启动时会**自动探测**并记住可用前缀——候选前缀必须返回真正的模型列表，因此 5xx 或一页 HTML 不会被误认为正确前缀——请求返回 404（路由不存在）时还会自动回退到另一个前缀；若回退连续 3 次都是另一前缀在真正应答，缓存前缀会直接翻转过去，使迁过路由的部署不再每次白跑一跳。
 - **响应规范化**：`/v1/models` 会把上游模型对象收敛成标准的 `{id, object, created, owned_by}`，并按白名单透出有用的扩展字段：`name`、`description`、`max_context_length` / `context_length`（`max_model_len` 作为兼容别名保留）、`quantization`（从模型名解析，如 `NVFP4`）；私有字段（`user_id`、`access_grants`、`permission`、`urlIdx` 等）一律不透出。
 - **实证而非照抄**：`capabilities`、`architecture`、`supported_parameters`、`reasoning` 全部通过向引擎发请求得出（见[逐模型探测](#逐模型探测思考挡位与能力)），绝不照抄 Open WebUI 的元数据；部署自身的功能开关改放信封的 `x_open_webui`，不会被误读成模型能力。
 
 ## 特性
 
-- **OpenAI 兼容**：`/v1/models`、`/v1/models/{id}`、`/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`，以及未实现路径的 `/v1/*` 兜底透传（同样具备前缀回退）。
+- **OpenAI 兼容**：`/v1/models`、`/v1/models/{id}`、`/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`，以及未实现路径的 `/v1/*` 兜底透传（同样具备前缀回退）——默认受白名单约束。
 - **自动适配上游版本**：`auto` / `v1` / `legacy` 三种上游 API 风格，启动探测 + 请求级回退。
 - **健壮的流式转发**：客户端断开时主动关闭上游连接，不会把连接挂到超时；正确剔除逐跳响应头；上游启用压缩时（`gzip` / `deflate` / `br` / `zstd`，取决于 HTTP 库支持），先解码再交给客户端。
 - **OpenAI 风格错误体**：返回 `{"error": {"message", "type", "code"}}`，而不是 FastAPI 默认的 `{"detail": ...}`，客户端能正常显示错误原因。
@@ -43,6 +43,19 @@ flowchart LR
 - **可选 CORS**：配置 `PROXY_CORS_ORIGINS` 后浏览器页面可以直连本代理（预检自动应答）；默认关闭，不扩大暴露面。
 - **模型别名**：通过 `MODEL_ALIASES` 把客户端请求的模型名映射到上游真实模型名。
 - **凭证脱敏**：日志里只打印 Token 前缀与长度，不落盘完整凭证。
+- **默认即加固**：兜底透传默认是白名单而不是"全量透传"；上游重定向被拒绝、绝不带着凭证跟随；上游的 `Set-Cookie` / `WWW-Authenticate` 不会到达客户端；请求体边读边计数（chunked 同样受限）；上游错误细节只进日志；每个请求都带可 grep 的关联 id。
+
+## 安全默认值一览
+
+| 行为 | 默认值 | 如何更改 |
+| --- | --- | --- |
+| `/v1/*` 兜底透传 | 白名单：`images`、`audio`、`files`、`responses` | `PASSTHROUGH_ALLOW=...`；`PASSTHROUGH_ALLOW=*` 恢复不设限 |
+| 客户端错误里的上游原文 | 隐藏（只进日志，并附 request id） | `EXPOSE_UPSTREAM_ERROR=true` |
+| 上游 3xx 应答 | 拒绝（绝不跟随） | 把 `OPEN_WEBUI_BASE_URL` 改为最终地址 |
+| 上游 `Set-Cookie` / `WWW-Authenticate` | 剔除 | —（客户端用代理 Key 鉴权） |
+| 局域网/非回环主机上的明文 http 上游 | 接受，仅启动时提示一次 | 前面加一层 TLS 反向代理，或确认链路可信 |
+| 请求体大小 | 边读边封顶（`MAX_BODY_BYTES`，10 MiB） | `MAX_BODY_BYTES` |
+| 响应头 | `X-Request-ID`、`Cache-Control: no-store, private`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` | — |
 
 ## 目录结构
 
@@ -51,11 +64,16 @@ flowchart LR
 ├── app.py                  # FastAPI 路由、OpenAI 兼容层、CLI 入口
 ├── config.py               # 全部配置项（环境变量 / .env）
 ├── lang.py                 # 用户可见消息本地化（zh / en）
+├── models.py               # 模型列表规范化 + 引擎指纹（纯逻辑）
 ├── model_probe.py          # 逐模型探测：报错解析、探测载荷、缓存
+├── probe_runner.py         # 上游数据访问 + 探测编排（运行时单例）
 ├── session_store.py        # 凭证读写 + Playwright 浏览器登录抓取
 ├── upstream.py             # 上游转发：连接池、前缀探测、流式
+├── atomic_json.py          # 共用的原子（flush + fsync + rename）JSON 写入
+├── request_context.py      # 逐请求关联 id（contextvar + 日志格式化器）
 ├── requirements.txt        # 运行服务的最小依赖
 ├── requirements-browser.txt# 可选：浏览器登录所需的 Playwright
+├── requirements-dev.txt    # 可选：运行测试所需的 pytest
 ├── .env.example            # 配置模板
 └── tests/
     ├── mock_openwebui.py   # 标准库实现的 Open WebUI 模拟器
@@ -67,7 +85,7 @@ flowchart LR
 
 ### 1. 安装依赖
 
-Python 3.9+：
+Python 3.11+（探测刷新路径使用了 `asyncio.TaskGroup`）：
 
 ```bash
 pip install -r requirements.txt
@@ -188,14 +206,16 @@ for await (const part of stream) {
 | 方法   | 路径                     | 鉴权 | 说明                        |
 | ---- | ---------------------- | -- | ------------------------- |
 | GET  | `/`                    | 否* | 服务信息与已注册端点；上游地址仅在带 Key 时返回 |
-| GET  | `/healthz`             | 否* | 健康检查恒 200；上游地址与探测前缀仅在带 Key 时返回 |
+| GET  | `/healthz`             | 否* | 健康检查恒 200；上游地址、探测前缀与探测健康状态仅在带 Key 时返回 |
 | GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构，并附带实证的能力 / 参数 / 思考挡位；信封还带 `x_open_webui` 实例元信息 |
 | GET  | `/v1/models/{id}`      | 是  | 获取单个模型（`id` 可含斜杠）；未知 id 返回 OpenAI 风格 404 错误体 |
 | POST | `/v1/chat/completions` | 是  | 对话补全，支持 `stream: true`    |
 | POST | `/v1/embeddings`       | 是  | 向量嵌入（上游需支持）               |
-| ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径             |
+| ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径，但受 `PASSTHROUGH_ALLOW` 约束（默认 `images`、`audio`、`files`、`responses`）；其余路径直接 403，不碰上游 |
 
-鉴权支持 `Authorization: Bearer <key>` 与 `X-API-Key: <key>` 两种写法。若 `PROXY_API_KEY` 留空则不鉴权。
+鉴权支持 `Authorization: Bearer <key>` 与 `X-API-Key: <key>` 两种写法，`PROXY_API_KEY` 与 `PROXY_API_KEYS` 里的任意一把都可通过。两者都为空时不鉴权。
+
+每个响应都带 `X-Request-ID` 头：客户端提供了可用值时用它的，否则自动生成。同一个 id 出现在服务端日志行里，因此"这次请求失败了"只需要 grep 一个字符串。带有效 Key 的 `/healthz` 还会给出探测健康状态（`status`、连续被拒次数、最近一轮计数）。
 
 `/v1/models` 的查询参数会被忽略，这与 OpenAI 官方端点一致（它本身没有分页；只有 Anthropic 与 Gemini 那两种不同形状的 API 才实现了分页）。
 
@@ -205,13 +225,14 @@ for await (const part of stream) {
 
 | 环境变量                  | 默认值                     | 说明                                     |
 | --------------------- | ----------------------- | -------------------------------------- |
-| `OPEN_WEBUI_BASE_URL` | `http://localhost:8080` | 上游地址，必须带 `http://` 或 `https://`，结尾不带斜杠     |
+| `OPEN_WEBUI_BASE_URL` | `http://localhost:8080` | 上游地址，必须带 `http://` 或 `https://`，结尾不带斜杠。localhost 与局域网地址都是一等公民；非回环的明文 `http` 地址同样被接受，只是启动时提示一次（凭证会明文过网） |
 | `UPSTREAM_API_STYLE`  | `auto`                  | `auto` / `v1` / `legacy`               |
 | `UPSTREAM_VERIFY_SSL` | `true`                  | 上游为自签证书时设 `false`                      |
 | `UPSTREAM_TRUST_ENV`  | `true`                  | 是否读取系统代理环境变量；上游在本机或内网而系统配了代理时设 `false` |
 | `PROXY_HOST`          | `0.0.0.0`               | 服务监听地址（仅服务端配置；`0.0.0.0` = 所有网卡，不是客户端要填的 API 地址） |
 | `PROXY_PORT`          | `8000`                  | 监听端口                                   |
 | `PROXY_API_KEY`       | 空                       | 对外访问密钥，留空表示不鉴权                         |
+| `PROXY_API_KEYS`      | 空                       | 可选：用多把具名 Key 代替单一共享 Key，格式为逗号分隔的 `name:key`（不带名字的条目会自动命名）。使单个客户端可被独立轮换或撤销；`PROXY_API_KEY` 并存生效 |
 | `PROXY_CORS_ORIGINS`  | 空                       | 允许跨域的来源列表（逗号分隔）；留空不启用 CORS             |
 | `REQUEST_TIMEOUT`     | `300`                   | 上游请求总超时（秒）                             |
 | `CONNECT_TIMEOUT`     | `10`                    | 连接上游超时（秒）                              |
@@ -221,6 +242,11 @@ for await (const part of stream) {
 | `MODEL_PROBE_TIMEOUT`     | `30`            | 单个模型探测的超时（秒）                                                     |
 | `MODEL_PROBE_WAIT`        | `5`             | `/v1/models` 在**确有探测飞行中**时等待的最长秒数，`0` = 从不等待                |
 | `EXPOSE_INSTANCE_META`    | `true`          | `/v1/models` 信封是否携带 `x_open_webui`（严格校验的客户端可关闭）              |
+| `EXPOSE_UPSTREAM_ERROR`   | `false`         | 是否把上游错误响应体原文放进返回给客户端的错误消息；默认 `false` 时细节只进日志，客户端收到固定文案 + request id |
+| `MAX_BODY_BYTES`          | `10485760`      | 拒绝超过该字节数的 JSON 请求体（413）。边读边计数，因此无 `Content-Length` 的 chunked 请求体同样受限 |
+| `MODEL_LIST_TTL`          | `10`            | 上游模型列表的复用秒数，超时后重新拉取；`0` = 每次请求都拉取            |
+| `ALLOW_INSECURE`          | `false`         | 安全联锁覆盖：允许在没有配置任何代理 Key 时监听非回环地址启动     |
+| `PASSTHROUGH_ALLOW`       | `images,audio,files,responses` | `/v1/*` 兜底透传允许转发的子路径（精确或子路径匹配）。`*` = 不设限（历史上的行为）；显式空值 = 一条都不放行 |
 | `MODEL_ALIASES`       | 空                       | JSON 对象，模型名映射                          |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`，非法值回退 `INFO` |
 | `DEBUG`               | `false`                 | 为 `true` 时等价于 `LOG_LEVEL=DEBUG`        |
@@ -287,8 +313,10 @@ Open WebUI 会给每个模型上报 `info.meta.capabilities`，但那是它的**
 
 `default_model_capabilities` 只包含**所有上报模型都一致**的键；上游并非一致上报的键
 （某部署里有一个模型没有 `usage`）不进模板，而确实上报了它的模型会把自身取值放在该模型
-的 `x_open_webui.capabilities` 里。无论模板是否存在，`/v1/models` 的形状都保持不变；
-`EXPOSE_INSTANCE_META=false` 则完全去掉 `x_open_webui`。
+的 `x_open_webui_deviations.capabilities` 里。两个键刻意不同名：`x_open_webui` 是信封上的
+部署级元信息，`x_open_webui_deviations` 是 `data[]` 里单个模型与该模板的偏离。无论模板是否
+存在，`/v1/models` 的形状都保持不变；`EXPOSE_INSTANCE_META=false` 则完全去掉信封上的
+`x_open_webui`。
 
 ### 一次探测做了什么
 
@@ -301,7 +329,10 @@ Open WebUI 会给每个模型上报 `info.meta.capabilities`，但那是它的**
 | 2. **逐值实证** | ≤7 | 只有具体挡位返回 200 才算数。这正是抓住**第二层**校验（gpt-oss 的 Harmony、Qwen 自带解析器）的关键——它会拒绝第一层的子集 |
 | 3. 请求参数 | 1（+≤3 次重试） | 一次合并请求；400 会归因到某个参数并剔除后重试。同时得出 `function_calling` 与 `structured_outputs` |
 | 4. 视觉 | 1 | 一张 1×1 PNG：返回 400 `"... is not a multimodal model"` 即 `vision: false` |
-| 5. 默认行为 | 1 | 同样的请求但不带 `reasoning_effort`；是否返回思考文本给出 `default_enabled` |
+| 5. 默认行为 | 1（不可探测的模型为 0） | 同样的请求但不带 `reasoning_effort`；是否返回思考文本给出 `default_enabled`。第 1 步发现上游根本不校验该字段时，第 3 步自己的 200 已经回答了这个问题，因此跳过这一发 |
+
+每个探测请求都带 `X-WebUI-Proxy-Probe: 1`，因此在上游日志里可以把探测流量与真实对话
+流量区分开（两者共用同一连接池与凭证）。
 
 第 2 步是 `supported_efforts` 可信的原因。外层 schema 是**超集**：线上 Qwen3.8-27B 广告
 `none/minimal/low/medium/high/xhigh/max`，实际只接受 `none/low/medium/xhigh`，而它自己的
@@ -353,7 +384,13 @@ Open WebUI 会给每个模型上报 `info.meta.capabilities`，但那是它的**
 
 `authorization` 与 `cookie` 至少要有其一。键名大小写不敏感（`user_agent` / `User-Agent` 都接受），因此早期版本写入的大写形式依然可用。如果你能从浏览器 F12 里拿到 Open WebUI 的 JWT，也可以**手写这个文件**，完全跳过浏览器登录这一步。
 
-> `session.json` 已在 `.gitignore` 中，切勿提交。POSIX 系统下写入时会自动收敛为 `600` 权限。
+`base_url` 记录的是抓取这份凭证时所指向的上游，并且会被校验：与当前配置的
+`OPEN_WEBUI_BASE_URL` 不一致时直接拒绝该文件，错误里同时给出两个地址。浏览器凭证与签发它
+的站点绑定，拿到另一个实例上复用只会得到一个令人困惑的上游 401。结尾斜杠与大小写差异不算
+不一致；没有 `base_url` 字段的旧文件照旧放行。更换上游后请重新运行
+`python app.py --login`。
+
+> `session.json` 已在 `.gitignore` 中，切勿提交，也不要打进容器镜像。它不是示例文件：只要它还在，它就是一份**可用的上游会话**——备份、同步目录、截图里都不要带上它。请像对待密码一样保管，并在其中会话作废后删除它（重新登录过之后旧的就毫无价值，删掉最多再登录一次）。POSIX 系统下写入时会自动收敛为 `600` 权限；Windows 下沿用继承的 ACL，共享机器上建议放在仅当前用户可读的目录。每次写出该文件时，服务都会打印这条提醒。
 
 ## 测试
 
@@ -366,9 +403,15 @@ python tests/test_units.py    # 纯逻辑单测，秒级完成，无需联网
 python tests/test_smoke.py    # 端到端：拉起 mock 上游 + 真实启动本代理
 ```
 
-`test_units.py` 覆盖：凭证序列化与旧格式兼容、登录信号判定、模型列表规范化、配置解析容错、错误响应结构。
+可选用 pytest 运行（先 `pip install -r requirements-dev.txt`）：
 
-`test_smoke.py` 覆盖：健康检查、鉴权拒绝、模型列表规范化、非流式/流式对话、上游错误透传、参数校验、embeddings、兜底透传、上游 gzip 压缩响应、主候选 5xx 时的前缀回退、凭证缺失时的 503；并对 `auto` / `v1` / `legacy` 三种上游风格各跑一遍。
+```bash
+pytest tests/test_units.py
+```
+
+`test_units.py` 覆盖：凭证序列化与旧格式兼容、登录信号判定、模型列表规范化、语言 key 表与源码实际用键的一致性、配置解析容错、错误响应结构、上游回退/自愈路径，以及本轮加固的上游地址**接受面**（localhost / 局域网 / 私有 / 明文 http / 自定义端口一律放行，只有畸形 URL 被拒）与"明文链路提示"的判定、透传白名单解析、具名代理 Key、request id 清洗、探测健康状态机、请求体上限（声明长度与 chunked 两条路径）、重定向与凭证类响应头的处理。直接运行时保持原有的汇总输出。
+
+`test_smoke.py` 覆盖：健康检查、鉴权拒绝、模型列表规范化、非流式/流式对话、上游错误透传（默认脱敏并回显 request id）、参数校验、embeddings、兜底透传、上游 gzip 压缩响应、主候选 5xx 时的前缀回退、仅有 Cookie 的凭证、凭证属于另一个上游、凭证缺失时的 503、request id 回显与清洗、安全响应头、严格 `stream` 判定、上游 `Set-Cookie` 被剔除、3xx 被拒绝而非跟随（以"重定向目标从未被请求"实证）、透传白名单（默认 / 显式列表 / `*` / 空值）、请求体上限、具名 Key；并对 `auto` / `v1` / `legacy` 三种上游风格各跑一遍。探测场景等待后台探测落地的默认上限是 60 秒，机器慢时可用 `SMOKE_PROBE_TIMEOUT=180` 调大。
 
 ## 故障排除
 
@@ -416,13 +459,54 @@ python app.py --login
 
 浏览器登录这一步本质上需要人工交互，服务器无 GUI 时需要 Xvfb 等虚拟显示。更推荐的做法是在本地登录一次，把生成的 `session.json` 复制到服务器。
 
+**Q: `python app.py --login` 报 Playwright / 浏览器错误就退出了**
+
+常见原因有两个：浏览器从未下载、以及机器没有显示器。这两种情况都会以一条带解决办法的消息报出，而不是一页堆栈：先 `pip install -r requirements-browser.txt`，再执行 `playwright install chromium`；无显示器的机器上设置 `LOGIN_HEADLESS=true`（或改用 Xvfb）。两者都无效时，可在有桌面的机器上登录一次，再把 `session.json` 拷过去。
+
+**Q: 某个 `/v1/...` 路径返回 403 `passthrough_forbidden`**
+
+该路径不在兜底透传白名单里，默认白名单是 `images,audio,files,responses`。把需要的子路径加进去（`PASSTHROUGH_ALLOW=responses,images,...`），或设 `PASSTHROUGH_ALLOW=*` 恢复全量透传。请记住：每加一条，就等于让代理 Key 持有者能用你的账号访问该上游路由。
+
+**Q: 请求报"上游返回了重定向……拒绝跟随"**
+
+携带你凭证的那次请求被上游以 3xx 回答了。跟随它会把这些凭证发给 `Location` 指向的任意主机，因此代理选择拒绝——http→https 跳转的部署、或强制门户（captive portal）截流，在这里都会是这个表现。把 `OPEN_WEBUI_BASE_URL` 直接写成重定向指向的最终地址（若是网络认证页，请先完成认证）。日志行里带有 `Location` 取值。
+
+**Q: 启动日志提示"非回环主机上的明文 http"**
+
+这是提示，不是故障——局域网里的 Open WebUI（`http://192.168.x.x:3000`）对本项目而言是完全正常的部署方式，照常工作。它存在的原因是 `Authorization` 与 `Cookie` 会明文过网：该网段不完全可信时请在前面加一层 TLS 反向代理，自己掌控的链路可以直接忽略。回环地址永远不会触发这条提示。
+
+**Q: 客户端收到的错误信息里不再有上游原文了**
+
+这是 1.1.0 起的默认行为（`EXPOSE_UPSTREAM_ERROR=false`）：上游响应体经常暴露内部主机名、路径与网络细节。请改为引用响应里的 `request id`，在服务日志里 grep 它——完整细节都记在那里。想要旧行为可设 `EXPOSE_UPSTREAM_ERROR=true`。
+
 ## 安全建议
 
-- 一定要设置 `PROXY_API_KEY`，否则任何能访问该端口的人都能借用你的 Open WebUI 身份。
-- 不要把 `session.json` 提交进版本库或放进容器镜像。
+- 一定要设置 `PROXY_API_KEY`（或 `PROXY_API_KEYS`），否则任何能访问该端口的人都能借用你的 Open WebUI 身份。
+- **代理 Key 等同于上游会话权限——限于白名单范围之内**：`/v1/{path}` 兜底透传会附带抓取到的浏览器凭证转发请求，因此泄露 Key 等同于泄露你的 Open WebUI 登录本身。默认白名单（`images`、`audio`、`files`、`responses`）把这种等价关系限制在这些路由上；每加一条都会放宽，`PASSTHROUGH_ALLOW=*` 则恢复"不设限"。当前生效的是哪种模式，启动日志里一定会写明。
+- **凭证不会被送给重定向目标**：共享上游客户端不跟随重定向。3xx 会被上报为上游故障，并把 `Location` 记进日志，而不是把你的 `Authorization` / `Cookie` 重发给它指向的主机。
+- **上游的会话 Cookie 不会到达客户端**：`Set-Cookie`、`Set-Cookie2`、`WWW-Authenticate` 一律从上游响应中剔除。否则经兜底透传可达的登录类端点，可能把一份可绕过本代理的上游会话直接交给客户端。
+- **上游错误不再暴露你的内部信息**：默认 `EXPOSE_UPSTREAM_ERROR=false` 时上游响应体只进日志，客户端拿到固定文案 + request id（`X-Request-ID`，每个响应与每行日志都带）。如果你更愿意在客户端侧排障并接受额外暴露，可设为 `true`。
+- **明文上游链路只提示、不拒绝**：当 `OPEN_WEBUI_BASE_URL` 是非回环主机上的明文 `http` 时，启动日志只说一次。本机与局域网部署（`http://192.168.x.x:3000`）都是正常且受支持的用法——这条提示只是在说明凭证会明文过网，链路确实需要保护时在前面加一层 TLS 反向代理即可。
+- 内置安全联锁：没有配置任何代理 Key 且 `PROXY_HOST` 非回环地址时**拒绝启动**；确需如此请显式设置 `ALLOW_INSECURE=true`。
+- 不要把 `session.json` 提交进版本库或放进容器镜像；只要它存在，它就是一份可用凭证。
 - 尽量只监听 `127.0.0.1`，需要对外时套一层反向代理并启用 HTTPS。
-- 本代理会原样转发请求体，请不要把它暴露给不可信的调用方。
+- 本代理会原样转发请求体（上限见 `MAX_BODY_BYTES`），请不要把它暴露给不可信的调用方。
 - 启用 CORS 时（`PROXY_CORS_ORIGINS`）请按需列出最小来源集合，避免使用 `*`。
+- **仅支持单进程**：代理持有进程内状态（上游前缀、探测缓存、凭证缓存），不要用 `uvicorn --workers N` 多进程运行。
+
+### 1.1.0 的行为变更
+
+从 1.0.x 升级时以下默认值发生了变化；每一项都只差一个环境变量就能回到旧行为：
+
+| 变更点 | 旧行为 | 现行为 |
+| --- | --- | --- |
+| `/v1/*` 兜底透传 | 任意路径都转发 | 白名单（`images`、`audio`、`files`、`responses`）；`PASSTHROUGH_ALLOW=*` 恢复旧行为 |
+| 客户端错误里的上游原文 | 默认回显 | 默认隐藏（`EXPOSE_UPSTREAM_ERROR=true` 可恢复） |
+| 上游 3xx | 静默跟随 | 明确拒绝（若你的部署靠重定向规范化，请改 `OPEN_WEBUI_BASE_URL`） |
+| `stream: "false"`（字符串） | 被当作流式 | 按非流式处理，与其它非 `true` 取值一致 |
+| 被拒的透传路径 | 404 | 403 `passthrough_forbidden` |
+
+除此之外没有形态变化：localhost 与局域网上游、`UPSTREAM_VERIFY_SSL=false`、系统代理变量以及各项超时/上限都与原来一致。
 
 ## 贡献
 

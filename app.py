@@ -18,16 +18,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import logging
-import re
 import sys
-import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from secrets import compare_digest
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lang
 import httpx
@@ -35,6 +31,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 try:
     from config import Settings, settings
@@ -57,31 +54,74 @@ from session_store import (
     perform_browser_login,
     session_exists,
 )
-from model_probe import (
-    EFFORT_ORDER,
-    PROBE_SENTINEL,
-    PROBED_PARAMETERS,
-    STATUS_OK,
-    STATUS_PARTIAL,
-    STATUS_UNPROBEABLE,
-    ModelProbe,
-    ModelProbeCache,
-    baseline_payload,
-    derive_reasoning_capability,
-    effort_payload,
-    extract_default_effort,
-    extract_effort_candidates,
-    looks_like_effort_error,
-    parameter_of_error,
-    parameter_payload,
-    response_has_reasoning,
-    vision_payload,
+from upstream import (
+    AUTH_FAILURE_CODES,
+    UpstreamClient,
+    UpstreamRequestInvalid,
+    UpstreamUnavailable,
 )
-from upstream import AUTH_FAILURE_CODES, UpstreamClient, UpstreamUnavailable
+from model_probe import looks_like_effort_error  # noqa: F401 - used by the chat route
+# Request correlation (U-7): one id per request, carried by every log line it produces
+# and echoed back in the X-Request-ID response header.
+#
+# 请求关联（U-7）：每个请求一个 id，随它产生的每一行日志携带，并在 X-Request-ID
+# 响应头里回显。
+from request_context import (
+    RequestIdFormatter,
+    bind_request_id,
+    new_request_id,
+    request_id_suffix,
+)
+# Model-list normalization (pure logic, no HTTP/cache/config) lives in models.py (R5);
+# the names are re-exported so routes and tests keep addressing them through app.
+#
+# 模型列表规范化（纯逻辑，不碰 HTTP/缓存/配置）在 models.py（R5）；这里重新导出这些
+# 名字，使路由与测试继续通过 app 模块访问它们。
+from models import (  # noqa: F401 - re-exports for routes and tests
+    _model_fingerprint,
+    _model_summaries,
+    _parse_timestamp,
+    _QUANT_PATTERN,
+    _raw_model_capabilities,
+    _shared_default_capabilities,
+    normalize_model,
+)
+# Runtime singletons (upstream client, probe cache) and the whole probe orchestration
+# live in probe_runner; the names are re-exported here so routes and tests can keep
+# addressing them through the app module.
+#
+# 运行时单例（上游客户端、探测缓存）与整套探测编排都在 probe_runner；这里
+# 重新导出这些名字，使路由与测试继续通过 app 模块访问它们。
+import probe_runner  # noqa: E402 - main() mirrors rebuilt singletons into it
+from probe_runner import (  # noqa: F401 - re-exports for routes and tests
+    VALIDATION_FAILURE_CODES,
+    _background_tasks,
+    _ensure_instance_meta,
+    _fetch_raw_models,
+    _get_raw_models_cached,
+    _healing,
+    _http_error,
+    _instance_meta,
+    _probe_model,
+    _PROBE_ANNOUNCE_TIMEOUT,
+    _refresh_model_probe,
+    _refresh_state,
+    _RefreshState,
+    _shutdown_background_tasks,
+    _spawn_model_probe_refresh,
+    _startup_check,
+    _trigger_probe_heal,
+    HttpError,
+    extract_model_list,
+    model_probe,
+    probe_cache_status,
+    probe_health,
+    upstream,
+)
 
 logger = logging.getLogger("webui-proxy")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def configure_logging(current: Settings) -> None:
@@ -95,838 +135,81 @@ def configure_logging(current: Settings) -> None:
     level = getattr(logging, level_name, None)
     if not isinstance(level, int):
         level = logging.DEBUG if level_name == "TRACE" else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    # The handler carries the per-request correlation id (U-7). RequestIdFormatter
+    # supplies "-" when a record was emitted outside a request (startup, CLI), so the
+    # format needs no per-call-site cooperation.
+    #
+    # 处理器携带逐请求的关联 id（U-7）。RequestIdFormatter 在请求之外（启动、CLI）
+    # 产生的记录上填空 "-"，因此日志格式不需要任何调用点配合。
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        RequestIdFormatter("%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s: %(message)s")
     )
+    # force=True: this runs at import time and again from the lifespan, and duplicate
+    # handlers would double every log line.
+    #
+    # force=True：本函数在 import 期与 lifespan 中各跑一次，重复的处理器会让每行日志翻倍。
+    logging.basicConfig(level=level, handlers=[handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-upstream = UpstreamClient(settings)
-
-# Per-model probe cache (loaded lazily; persisted next to session.json)
-# 逐模型探测缓存（惰性加载；持久化在 session.json 旁边）
-model_probe = ModelProbeCache(settings.model_probe_cache_file)
-
-
-# --------------------------------------------------------------------------- #
-# Lifecycle
-# 生命周期
-# --------------------------------------------------------------------------- #
-async def _startup_check() -> bool:
-    """Validate credentials and upstream connectivity at startup.
-
-    启动时校验凭证与上游连通性。返回 True 表示凭证可用。
+def _enforce_listen_safety(current: Settings) -> None:
     """
-    if not settings.proxy_api_key:
-        logger.warning(lang.t("no_proxy_key"))
+    D13: an unauthenticated proxy listening on a non-loopback interface is an
+    open door to the upstream session. Refuse to start unless the operator
+    explicitly acknowledges with ALLOW_INSECURE=true.
+    """
+    if current.authentication_enabled() or current.allow_insecure:
+        return
+    host = (current.proxy_host or "").strip().lower()
+    loopback = host in ("127.0.0.1", "localhost", "::1", "[::1]", "")
+    if not loopback:
+        logger.error(lang.t("insecure_listen_refused", host=current.proxy_host))
+        raise SystemExit(2)
 
-    if not session_exists(settings):
+
+def _log_exposure_summary(current: Settings) -> None:
+    """
+    Report the settings that decide how far the deployment is exposed: the passthrough
+    allowlist, how many proxy keys exist (U-1), and whether the upstream link is
+    cleartext (U-8). All of them are decisions the operator should see confirmed in the
+    startup log, not discover from behavior.
+
+    报告决定暴露面的几项设置：透传白名单、Key 数量（U-1），以及上游链路是否明文（U-8）。
+    它们都是运维应当在启动日志里看到确认、而不是从行为反推的决定。
+    """
+    if current.upstream_is_plain_http_nonloopback():
+        # U-8: a notice, not a refusal -- "http://192.168.x.x:3000" is one of this
+        # project's normal deployments. Loopback stays silent.
+        #
+        # U-8：提示而非拒绝——"http://192.168.x.x:3000" 是本项目的常规部署形态之一。
+        # 回环地址不提示。
         logger.warning(
-            lang.t("session_missing_hint", path=settings.session_file),
+            lang.t("upstream_plain_http_warning", url=current.open_webui_base_url)
         )
-        return False
-
-    try:
-        session = load_session(settings)
-    except SessionError as exc:
-        logger.warning(lang.t("creds_unusable", exc=exc))
-        return False
-
-    # The probe request itself is an authenticated GET /models, so a single request
-    # performs both prefix discovery and credential validation (the old implementation
-    # called detect_prefix + get_models and hit the upstream twice).
-    #
-    # 探测请求本身就是一次带凭证的 GET /models，一次请求同时完成
-    # 找前缀 + 验凭证（旧实现 detect_prefix + get_models 会打两次）。
-    try:
-        prefix, status = await upstream.probe_prefix(session)
-    except UpstreamUnavailable as exc:
-        logger.warning(lang.t("startup_cant_connect", exc=exc))
-        return False
-
-    if status in AUTH_FAILURE_CODES:
-        logger.error(
-            lang.t("creds_expired", status=status)
+    if current.passthrough_allow_all:
+        logger.warning(lang.t("passthrough_unrestricted"))
+    elif current.passthrough_allow:
+        logger.info(
+            lang.t("passthrough_allowlist", paths=", ".join(current.passthrough_allow))
         )
-        return False
-
-    if status == 404:
-        # The old behavior misreported a 404 as "credentials valid"; give a clear error here
-        # 旧行为会把 404 误报成"凭证校验通过"，这里给出明确错误
-        logger.error(
-            lang.t("models_404", prefix=prefix)
-        )
-        return False
-
-    if not 200 <= status < 300:
-        # probe_prefix only accepts 2xx (with a real model list) and 401/403 as
-        # conclusive, so anything reaching here means no candidate could be confirmed
-        # (5xx, or a 200 that is not the model list). Reporting that as "credentials
-        # valid" would be a claim nothing supports.
-        #
-        # probe_prefix 只把 2xx（且响应体确实是模型列表）与 401/403 当作结论，因此走到这里
-        # 说明没有任何候选能被确认（5xx，或 200 但不是模型列表）。把它报成"凭证校验通过"
-        # 是没有任何依据的结论。
-        logger.error(lang.t("startup_bad_status", prefix=prefix, status=status))
-        return False
-
-    logger.info(lang.t("creds_ok", status=status, desc=session.describe()))
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Per-model probe: reasoning efforts, capabilities and request parameters
-# 逐模型探测：思考挡位、能力与请求参数
-# --------------------------------------------------------------------------- #
-# Upstream statuses meaning "the engine rejected the request body", i.e. the probe
-# learned something definite. Anything else (404, 5xx) is transient.
-#
-# 表示"引擎拒绝了请求体"的上游状态码，即探测学到了确定的东西。其它（404、5xx）
-# 都是暂时性的。
-VALIDATION_FAILURE_CODES = (400, 422)
-
-
-class _ProbeAuthExpired(Exception):
-    """
-    Raised when the upstream rejects probe requests with 401/403: credentials
-    died mid-probe, the whole refresh must stop instead of hammering a dead
-    session once per model.
-
-    上游对探测请求返回 401/403 时抛出：凭证在探测中途失效，整个刷新应立即
-    停止，而不是对每个模型都拿着死凭证再撞一遍。
-    """
-
-
-class _ProbeTransient(RuntimeError):
-    """
-    The probe cannot reach a conclusion right now (network hiccup, 5xx, timeout):
-    the caller records a failure with backoff and keeps the earlier facts.
-
-    探测此刻得不出结论（网络抖动、5xx、超时）：调用方记录一次失败并退避，
-    同时保留此前已确立的事实。
-    """
-
-
-async def _close(response: httpx.Response) -> None:
-    """Close a response unless it is already closed. / 关闭响应（若尚未关闭）。"""
-    if not response.is_closed:
-        await response.aclose()
-
-
-def _engine_build(body: str) -> str:
-    """
-    The engine build string a chat response carries (`system_fingerprint`), kept for
-    diagnostics; "" when the body has none.
-
-    聊天响应携带的引擎构建串（`system_fingerprint`），用于诊断；没有则为 ""。
-    """
-    try:
-        payload = json.loads(body)
-    except (ValueError, TypeError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    return str(payload.get("system_fingerprint") or "")
-
-
-async def _probe_model(session: Any, model_id: str, fingerprint: str) -> ModelProbe:
-    """
-    Establish, by asking the engine, what one model accepts.
-
-    Every step is a real request with max_tokens=1, so a full probe costs at most a
-    handful of output tokens:
-
-      1. candidate discovery -- a sentinel `reasoning_effort` makes the outer schema
-         enumerate the levels it accepts;
-      2. per-value verification -- only a 200 for a concrete level counts, which is
-         what catches the second validation layer (Harmony, the model's own parser);
-      3. request parameters -- one merged request, retried without whatever the 400
-         blames; this also establishes function calling and structured outputs;
-      4. vision -- one request carrying a 1x1 image;
-      5. default behaviour -- one request with `reasoning_effort` omitted.
-
-    Raises _ProbeAuthExpired (abort the whole refresh) or _ProbeTransient (retry the
-    model later); every other outcome is a ModelProbe, complete or partial.
-
-    通过"问引擎"确立单个模型接受什么。
-
-    每一步都是 max_tokens=1 的真实请求，完整探测最多花费个位数输出 token：
-
-      1. 候选发现 —— 用哨兵 `reasoning_effort` 让外层 schema 枚举它接受的挡位；
-      2. 逐值实证 —— 只有具体挡位返回 200 才算数，这正是抓住第二层校验
-         （Harmony、模型自带解析器）的关键；
-      3. 请求参数 —— 一次合并请求，命中 400 就剔除被归因的参数后重试；这一步同时
-         确立函数调用与结构化输出；
-      4. 视觉 —— 一次携带 1x1 图片的请求；
-      5. 默认行为 —— 一次省略 `reasoning_effort` 的请求。
-
-    抛出 _ProbeAuthExpired（中止整轮刷新）或 _ProbeTransient（稍后重试该模型）；
-    其它任何结果都返回 ModelProbe，可能是完整的也可能是部分的。
-    """
-    probe = ModelProbe(fingerprint=fingerprint, probed_at=time.time())
-    unresolved = 0
-
-    async def ask(payload: Dict[str, Any]) -> httpx.Response:
-        """
-        Send one probe request. An auth failure aborts the whole refresh; a transport
-        failure is transient and never a claim about the model.
-
-        发送一次探测请求。凭证失效中止整轮刷新；传输失败是暂时性的，绝不构成
-        关于该模型的任何声明。
-        """
-        try:
-            response = await upstream.post(session, "chat/completions", payload)
-        except UpstreamUnavailable as exc:
-            raise _ProbeTransient(str(exc)) from exc
-        if response.status_code in AUTH_FAILURE_CODES:
-            status_code = response.status_code
-            await _close(response)
-            raise _ProbeAuthExpired(str(status_code))
-        return response
-
-    # --- 1. candidate discovery: the sentinel makes the outer schema talk --------
-    response = await ask(effort_payload(model_id, PROBE_SENTINEL))
-    sentinel_status = response.status_code
-    sentinel_body = response.text
-    await _close(response)
-
-    unprobeable = sentinel_status == 200
-    if unprobeable:
-        # The upstream ignored the sentinel: it does not validate the field, so a
-        # per-value answer would not mean anything either.
-        #
-        # 上游忽略了哨兵值：它不校验该字段，逐值回答同样没有意义。
-        probe.status = STATUS_UNPROBEABLE
-        candidates: List[str] = []
-    elif sentinel_status in VALIDATION_FAILURE_CODES:
-        probe.default_effort = extract_default_effort(sentinel_body)
-        # The enumeration is only the OUTER schema. When the phrasing is unknown,
-        # sweep the whole canonical list rather than give up: verification is what
-        # decides, so an unparsed candidate list costs requests, not correctness.
-        #
-        # 这个枚举只是**外层** schema。措辞不认识时改为遍历完整规范列表而不是放弃：
-        # 结论由实证决定，因此候选解析不出只多花几次请求，不影响正确性。
-        candidates = extract_effort_candidates(sentinel_body) or list(EFFORT_ORDER)
     else:
-        raise _ProbeTransient(f"sentinel probe returned HTTP {sentinel_status}")
-
-    # --- 2. per-value verification: only a 200 counts ---------------------------
-    for effort in candidates:
-        response = await ask(effort_payload(model_id, effort))
-        status_code = response.status_code
-        body = response.text
-        await _close(response)
-        if status_code == 200:
-            probe.supported_efforts.append(effort)
-            probe.system_fingerprint = probe.system_fingerprint or _engine_build(body)
-        elif status_code in VALIDATION_FAILURE_CODES:
-            # The model-level layer is the only place the engine sometimes names its
-            # default level ("Supported types are xhigh (default), ..."), so mine it
-            # here as well -- the outer schema error never carries that marker.
-            #
-            # 模型级那一层是引擎偶尔声明默认挡位的唯一地方（"Supported types are
-            # xhigh (default), ..."），所以这里也要挖一遍——外层 schema 的报错从不带
-            # 这个标注。
-            if probe.default_effort is None:
-                probe.default_effort = extract_default_effort(body)
-            continue
-        else:
-            unresolved += 1
-    probe.efforts_verified = not unprobeable and unresolved == 0
-
-    # --- 3. request parameters: one merged request, retried without the offender --
-    remaining = list(PROBED_PARAMETERS)
-    parameter_accepted: Dict[str, bool] = {}
-    for _ in range(len(PROBED_PARAMETERS) + 1):
-        if not remaining:
-            break
-        response = await ask(parameter_payload(model_id, remaining))
-        status_code = response.status_code
-        body = response.text
-        await _close(response)
-        if status_code == 200:
-            for parameter in remaining:
-                parameter_accepted[parameter] = True
-            probe.system_fingerprint = probe.system_fingerprint or _engine_build(body)
-            remaining = []
-            break
-        if status_code not in VALIDATION_FAILURE_CODES:
-            unresolved += 1
-            break
-        blamed = parameter_of_error(body)
-        if blamed == "reasoning_effort":
-            unresolved += 1
-            break
-        if blamed in ("tools", "tool_choice"):
-            # `tools` and `tool_choice` are one feature: an engine built without a
-            # tool-call parser rejects whichever of the two it sees first, so both
-            # are disproved together.
-            #
-            # `tools` 与 `tool_choice` 属于同一特性：没带 tool-call parser 的引擎会拒绝
-            # 先看到的那个，因此两者一起被证伪。
-            blamed_set = {"tools", "tool_choice"}
-        elif blamed:
-            blamed_set = {blamed}
-        else:
-            # The 400 cannot be attributed to one parameter: claim nothing about the
-            # ones still under test instead of guessing.
-            #
-            # 这个 400 无法归因到某个参数：对仍在测试的参数不做任何声明，而不是猜。
-            unresolved += 1
-            break
-        if not blamed_set & set(remaining):
-            # The blame landed on a parameter that is no longer under test (typically one
-            # already disproved in an earlier round). Claim nothing and stop, instead of
-            # re-sending the very same request until the round budget runs out.
-            #
-            # 归因落在已不在测试范围内的参数上（通常是上一轮已被证伪的那个）：不做任何声明
-            # 并立即停止，而不是把同一发请求重发到轮次耗尽。
-            unresolved += 1
-            break
-        for parameter in blamed_set & set(remaining):
-            parameter_accepted[parameter] = False
-        remaining = [item for item in remaining if item not in blamed_set]
-
-    if remaining:
-        # Defensive invariant: should the loop ever end with parameters still undecided,
-        # the probe must not claim they were established.
-        #
-        # 防御性不变式：循环若在仍有参数未定性的情况下结束，探测不得声称它们已确立。
-        unresolved += 1
-
-    # --- 4. vision: does the engine accept image content at all? ----------------
-    response = await ask(vision_payload(model_id))
-    status_code = response.status_code
-    body = response.text
-    await _close(response)
-    vision: Optional[bool]
-    if status_code == 200:
-        vision = True
-        probe.system_fingerprint = probe.system_fingerprint or _engine_build(body)
-    elif status_code in VALIDATION_FAILURE_CODES:
-        vision = False
-    else:
-        vision = None
-        unresolved += 1
-
-    # --- 5. default behaviour: the same request without reasoning_effort --------
-    response = await ask(baseline_payload(model_id))
-    status_code = response.status_code
-    body = response.text
-    await _close(response)
-    if status_code == 200:
-        probe.default_enabled = response_has_reasoning(body)
-        probe.system_fingerprint = probe.system_fingerprint or _engine_build(body)
-    elif status_code not in VALIDATION_FAILURE_CODES:
-        unresolved += 1
-
-    # --- 6. assemble the facts --------------------------------------------------
-    capabilities: Dict[str, bool] = {}
-    if vision is not None:
-        capabilities["vision"] = vision
-    if "tools" in parameter_accepted:
-        capabilities["function_calling"] = parameter_accepted["tools"]
-    if "response_format" in parameter_accepted:
-        capabilities["structured_outputs"] = parameter_accepted["response_format"]
-    reasoning_capable = derive_reasoning_capability(
-        None if unprobeable else probe.supported_efforts, probe.default_enabled
-    )
-    if reasoning_capable is not None:
-        capabilities["reasoning"] = reasoning_capable
-    probe.capabilities = capabilities
-
-    accepted_parameters = [
-        parameter for parameter, accepted in parameter_accepted.items() if accepted
-    ]
-    if probe.supported_efforts and not unprobeable:
-        accepted_parameters.append("reasoning_effort")
-    probe.supported_parameters = sorted(accepted_parameters)
-
-    if unprobeable:
-        probe.status = STATUS_UNPROBEABLE
-    elif unresolved:
-        probe.status = STATUS_PARTIAL
-        probe.last_error = f"{unresolved} probe request(s) left the answer open"
-    else:
-        probe.status = STATUS_OK
-    return probe
-
-
-def _raw_model_capabilities(raw: Any) -> Dict[str, bool]:
-    """
-    The capability dictionary one upstream model object carries, boolean entries only.
-
-    单个上游模型对象携带的能力字典，只取布尔项。
-    """
-    if not isinstance(raw, dict):
-        return {}
-    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
-    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
-    capabilities = meta.get("capabilities")
-    if not isinstance(capabilities, dict):
-        return {}
-    return {
-        str(key): value for key, value in capabilities.items() if isinstance(value, bool)
-    }
-
-
-def _shared_default_capabilities(raw_models: List[Any]) -> Optional[Dict[str, bool]]:
-    """
-    The capability keys every reporting upstream model agrees on -- that shared part
-    is Open WebUI's "default model metadata" template, merged into each model.
-
-    Keys the models disagree about (or that only some of them report) are left out;
-    a model's own value for those is published as a deviation under that model's
-    `x_open_webui`. Reporting the template once, as an instance-level fact, is
-    honest; repeating it inside each model's `capabilities` would claim something
-    about the model that is not true -- the same template was also handed to
-    DeepSeek-V4-Flash, which then answered an image with "is not a multimodal model".
-
-    上游每个上报能力的模型都一致同意的那些键——这部分共同值就是 Open WebUI 合并进
-    每个模型的"默认模型元数据"模板。
-
-    各模型不一致（或只有部分模型上报）的键不纳入模板；某个模型对这些键自己的取值，
-    作为"偏离"放在该模型的 `x_open_webui` 里。把模板作为实例级事实输出一次是诚实的；
-    重复放进每个模型的 `capabilities` 则是在声称模型具备它并不具备的能力——同一份
-    模板也发给了 DeepSeek-V4-Flash，而它对图片的回答是 "is not a multimodal model"。
-    """
-    reported = [
-        capabilities
-        for capabilities in (_raw_model_capabilities(raw) for raw in raw_models)
-        if capabilities
-    ]
-    if not reported:
-        return None
-    template: Dict[str, bool] = {}
-    for key in reported[0]:
-        values = {capabilities.get(key) for capabilities in reported}
-        if len(values) == 1 and None not in values:
-            template[key] = reported[0][key]
-    return template or None
-
-
-def _model_fingerprint(raw: Any, model_id: str) -> str:
-    """
-    A cheap identity for "the engine serving this model", derived purely from the
-    model list so checking it costs no request.
-
-    Deliberately excludes the top-level `created`: vLLM rebuilds its model card for
-    every response and stamps it with the current time, so it changes on every fetch
-    (verified: 1789036467 then 1789036470 three seconds later).
-
-    仅从模型列表推导出的"服务该模型的引擎"廉价标识，检查它不需要任何请求。
-
-    刻意排除顶层 `created`：vLLM 每次响应都会重建模型卡并打上当前时间，因此它每次
-    拉取都会变（实测：1789036467，三秒后 1789036470）。
-    """
-    if not isinstance(raw, dict):
-        return ""
-    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
-    engine = raw.get("openai") if isinstance(raw.get("openai"), dict) else {}
-    identity = {
-        "id": model_id,
-        "root": engine.get("root") or raw.get("root") or "",
-        "max_model_len": raw.get("max_model_len") or engine.get("max_model_len"),
-        "owned_by": engine.get("owned_by") or raw.get("owned_by") or "",
-        "base_model_id": info.get("base_model_id"),
-        "updated_at": info.get("updated_at"),
-    }
-    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
-
-
-async def _fetch_raw_models(session: Any) -> List[Any]:
-    """
-    GET the upstream model list and return its raw entries.
-
-    Every failure mode raises HttpError with an OpenAI-style body, so /v1/models and
-    /v1/models/{id} share one code path.
-
-    GET 上游模型列表并返回原始条目。
-
-    所有失败模式都以 HttpError（OpenAI 风格错误体）抛出，使 /v1/models 与
-    /v1/models/{id} 共用同一条代码路径。
-    """
-    try:
-        resp = await upstream.get_models(session)
-    except UpstreamUnavailable as exc:
-        raise _http_error(
-            exc.status_code, str(exc), error_type="server_error", code="upstream_unavailable"
-        ) from exc
-
-    try:
-        if resp.status_code in AUTH_FAILURE_CODES:
-            logger.error(lang.t("auth_failure_log", status=resp.status_code))
-            raise _http_error(
-                resp.status_code,
-                lang.t("err_upstream_unauthorized"),
-                error_type="invalid_request_error",
-                code="upstream_unauthorized",
+        logger.info(lang.t("passthrough_disabled"))
+    if current.proxy_api_keys:
+        logger.info(
+            lang.t(
+                "proxy_keys_summary",
+                count=len(current.proxy_api_keys),
+                names=", ".join(sorted(current.proxy_api_keys)),
             )
-        if resp.status_code != 200:
-            raise _http_error(
-                502,
-                lang.t("err_upstream_models_http", status=resp.status_code, text=resp.text[:500]),
-                error_type="server_error",
-                code="upstream_error",
-            )
-        try:
-            payload = resp.json()
-        except ValueError:
-            raise _http_error(
-                502,
-                lang.t("err_upstream_models_not_json", text=resp.text[:500]),
-                error_type="server_error",
-                code="upstream_error",
-            )
-    finally:
-        await _close(resp)
-
-    return extract_model_list(payload)
-
-
-async def _fetch_model_summaries(session: Any) -> Optional[List[Tuple[str, str]]]:
-    """
-    Fetch the upstream model list and reduce it to (model_id, engine fingerprint)
-    pairs; None means the list could not be retrieved (the caller skips this round).
-
-    拉取上游模型列表并归约为 (模型 id, 引擎指纹) 对；None 表示拉取失败
-    （调用方跳过本轮刷新）。
-    """
-    try:
-        raw_models = await _fetch_raw_models(session)
-    except HttpError as exc:
-        logger.warning(lang.t("probe_models_failed", status=exc.status_code))
-        return None
-
-    summaries: List[Tuple[str, str]] = []
-    for raw in raw_models:
-        model = normalize_model(raw)
-        if not model:
-            continue
-        summaries.append((model["id"], _model_fingerprint(raw, model["id"])))
-    return summaries
-
-
-# --------------------------------------------------------------------------- #
-# Instance-level Open WebUI metadata (served as the envelope's "x_open_webui")
-# 实例级 Open WebUI 元信息（作为信封的 "x_open_webui" 输出）
-# --------------------------------------------------------------------------- #
-# How long a /api/config snapshot is reused before being fetched again.
-# /api/config 快照复用的时长，超过后才重新拉取。
-INSTANCE_META_TTL = 300.0
-
-
-@dataclass
-class _InstanceMeta:
-    """
-    Facts about the Open WebUI deployment itself, as opposed to any single model:
-    the feature switches it has turned on, and the default model metadata template
-    it merges into every model.
-
-    关于 Open WebUI 部署本身（而非任何单个模型）的事实：它开启了哪些功能开关，
-    以及它合并进每个模型的默认模型元数据模板。
-    """
-
-    name: str = ""
-    version: str = ""
-    features: Dict[str, Any] = field(default_factory=dict)
-    default_model_capabilities: Optional[Dict[str, bool]] = None
-    fetched_at: float = 0.0
-
-    def is_usable(self) -> bool:
-        """Whether anything worth publishing is known. / 是否有值得输出的内容。"""
-        return bool(self.name or self.version or self.features or self.default_model_capabilities)
-
-    def is_fresh(self, now: float) -> bool:
-        return bool(self.fetched_at) and (now - self.fetched_at) < INSTANCE_META_TTL
-
-    def to_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {}
-        if self.name:
-            payload["name"] = self.name
-        if self.version:
-            payload["version"] = self.version
-        if self.features:
-            payload["features"] = self.features
-        if self.default_model_capabilities:
-            payload["default_model_capabilities"] = self.default_model_capabilities
-        return payload
-
-
-_instance_meta = _InstanceMeta()
-
-
-async def _ensure_instance_meta(session: Any) -> None:
-    """
-    Refresh the /api/config snapshot when it is stale. Best effort: a failure keeps
-    the previous snapshot for another TTL and never fails /v1/models.
-
-    快照过期时刷新 /api/config。尽力而为：失败则保留上一份快照再等一个 TTL，
-    绝不让 /v1/models 失败。
-    """
-    if _instance_meta.is_fresh(time.time()):
-        return
-    config = await upstream.get_instance_config(session)
-    _instance_meta.fetched_at = time.time()
-    if not isinstance(config, dict):
-        return
-    _instance_meta.name = str(config.get("name") or _instance_meta.name)
-    _instance_meta.version = str(config.get("version") or _instance_meta.version)
-    features = config.get("features")
-    if isinstance(features, dict):
-        _instance_meta.features = features
-
-
-@dataclass
-class _RefreshState:
-    """
-    What a running refresh is probing right now, so /v1/models can decide whether
-    waiting for it could actually change the answer.
-
-    正在运行的刷新此刻在探测什么，供 /v1/models 判断"等它"是否真能改变结果。
-    """
-
-    pending: Set[str] = field(default_factory=set)
-
-
-_refresh_state = _RefreshState()
-
-
-def _describe_probe(probe: ModelProbe) -> str:
-    """
-    A one-line, log-friendly summary of what a probe established.
-
-    对一次探测所确立内容的单行、便于记日志的摘要。
-    """
-    if probe.status == STATUS_UNPROBEABLE:
-        efforts = "upstream does not validate the field"
-    else:
-        efforts = ", ".join(probe.supported_efforts) or "none accepted"
-    parts = [f"efforts[{efforts}]"]
-    if probe.default_effort:
-        parts.append(f"default={probe.default_effort}")
-    if probe.default_enabled is not None:
-        parts.append(f"thinking_by_default={str(probe.default_enabled).lower()}")
-    if probe.capabilities:
-        parts.append(
-            "capabilities="
-            + ",".join(f"{key}:{str(value).lower()}" for key, value in probe.capabilities.items())
         )
-    if probe.status == STATUS_PARTIAL:
-        parts.append(f"partial({probe.last_error})")
-    return "; ".join(parts)
-
-
-# A refresh must not run concurrently with itself: the heal path can fire while a
-# startup / /v1/models refresh is still in flight, and two instances would probe the same
-# models twice, interleave `_refresh_state.pending`, and make each other's backoff
-# counters drift. The lock also makes "one refresh at a time" hold for the --probe CLI
-# path.
-#
-# 刷新不得与自身并发：自愈可能在启动 / `/v1/models` 触发的刷新仍在飞行时触发，两个实例会
-# 重复探测同一批模型、交错改写 `_refresh_state.pending`，并让双方的退避计数漂移。
-# 这把锁同时让 `--probe` CLI 路径也遵守"同一时刻至多一个刷新"。
-_refresh_lock: Optional[asyncio.Lock] = None
-
-
-def _refresh_mutex() -> asyncio.Lock:
-    """
-    The refresh mutex, created lazily on first use.
-
-    asyncio primitives bind to the event loop they are first used in, so a Lock built at
-    import time could belong to a loop that `asyncio.run()` (--check / --probe) or
-    uvicorn never uses -- and on Python 3.9 that binding happens even earlier. Creating
-    it on first use always yields a lock of the current loop.
-
-    刷新互斥锁，首次使用时惰性创建。
-
-    asyncio 原语会绑定到首次使用它的事件循环，因此在 import 期构造的锁可能属于一个
-    `asyncio.run()`（--check / --probe）或 uvicorn 都不会使用的循环——在 Python 3.9 上
-    这种绑定甚至发生得更早。首次使用时创建，拿到的总是当前循环的锁。
-    """
-    global _refresh_lock
-    if _refresh_lock is None:
-        _refresh_lock = asyncio.Lock()
-    return _refresh_lock
-
-
-async def _refresh_model_probe(
-    *,
-    summaries: Optional[List[Tuple[str, str]]] = None,
-    force: bool = False,
-) -> bool:
-    """
-    Serialize cache refreshes; the actual work is in _refresh_model_probe_locked.
-
-    串行化缓存刷新；实际工作见 _refresh_model_probe_locked。
-    """
-    async with _refresh_mutex():
-        return await _refresh_model_probe_locked(summaries=summaries, force=force)
-
-
-async def _refresh_model_probe_locked(
-    *,
-    summaries: Optional[List[Tuple[str, str]]] = None,
-    force: bool = False,
-) -> bool:
-    """
-    Reconcile the probe cache with the current model list, probe whatever is missing
-    or stale, persist, and report success.
-
-    `summaries` may be supplied by a caller that has just fetched the model list (the
-    /v1/models path), which saves one upstream request.
-
-    With force=False this is a no-op when every current model already has a conclusive
-    entry for its engine fingerprint -- the "unchanged engine -> serve cache" contract.
-
-    将探测缓存与当前模型列表对齐，探测缺失或过期的模型，持久化，并汇报结果。
-
-    `summaries` 可由刚刚拉过模型列表的调用方传入（/v1/models 路径），省一次上游请求。
-
-    force=False 时，若每个当前模型都已针对其引擎指纹有结论性条目，则什么都不做——
-    即"引擎未变 -> 直接用缓存"的约定。
-    """
-    try:
-        session = load_session(settings)
-    except SessionError as exc:
-        logger.warning("%s", exc)
-        return False
-
-    if summaries is None:
-        summaries = await _fetch_model_summaries(session)
-        if summaries is None:
-            return False
-
-    model_probe.load()
-    to_probe = model_probe.sync_with_models(summaries, force=force)
-    if not to_probe:
-        logger.info(lang.t("probe_cache_fresh", count=len(model_probe)))
-        return True
-
-    fingerprints = dict(summaries)
-    _refresh_state.pending = set(to_probe)
-    logger.info(lang.t("probe_begin", count=len(to_probe), models=", ".join(to_probe)))
-    semaphore = asyncio.Semaphore(settings.model_probe_concurrency)
-    counters = {"ok": 0, "partial": 0, "unprobeable": 0, "failed": 0}
-
-    async def worker(model_id: str) -> None:
-        async with semaphore:
-            try:
-                probe = await asyncio.wait_for(
-                    _probe_model(session, model_id, fingerprints[model_id]),
-                    timeout=settings.model_probe_timeout,
-                )
-            except _ProbeAuthExpired:
-                raise
-            except Exception as exc:  # noqa: BLE001 - per-model isolation
-                model_probe.record_failure(model_id, fingerprints[model_id], str(exc))
-                counters["failed"] += 1
-                logger.warning(lang.t("probe_model_failed", model=model_id, exc=exc))
-                return
-            model_probe.record_result(model_id, probe)
-            counters[probe.status] = counters.get(probe.status, 0) + 1
-            logger.info(lang.t("probe_model_done", model=model_id, summary=_describe_probe(probe)))
-
-    try:
-        await asyncio.gather(*(worker(model_id) for model_id in to_probe))
-    except _ProbeAuthExpired as exc:
-        logger.error(lang.t("probe_auth_expired", status=exc))
-        # Still save whatever was collected before the credentials died
-        # 凭证失效前收集到的结果仍然落盘
-        model_probe.save()
-        return False
-    finally:
-        _refresh_state.pending.clear()
-
-    model_probe.save()
-    logger.info(
-        lang.t(
-            "probe_finished",
-            ok=counters["ok"],
-            partial=counters["partial"],
-            unprobeable=counters["unprobeable"],
-            failed=counters["failed"],
-        )
-    )
-    logger.info(
-        lang.t("probe_cache_saved", path=settings.model_probe_cache_file, count=len(model_probe))
-    )
-    return True
-
-
-_refresh_task: Optional[asyncio.Task] = None
-
-
-def _spawn_model_probe_refresh(
-    *, summaries: Optional[List[Tuple[str, str]]] = None
-) -> Optional[asyncio.Task]:
-    """
-    Launch a cache refresh in the background, at most one at a time, and return the
-    running task (freshly started or already in flight) so callers may wait for it.
-
-    后台启动一次缓存刷新，同一时刻至多一个实例，并返回运行中的任务
-    （新启动的或已在跑的），调用方可选择性地等待它。
-    """
-    global _refresh_task
-    if _refresh_task is not None and not _refresh_task.done():
-        return _refresh_task
-
-    async def runner() -> None:
-        try:
-            await _refresh_model_probe(summaries=summaries)
-        except Exception as exc:  # noqa: BLE001 - background task must not die silently
-            logger.warning(lang.t("probe_task_error", exc=exc))
-
-    _refresh_task = asyncio.create_task(runner())
-    return _refresh_task
-
-
-# Models that already have a heal probe scheduled, so a burst of bad requests cannot
-# stampede the upstream with one refresh each.
-#
-# 已安排自愈探测的模型，避免一串坏请求各自触发一次刷新、把上游打爆。
-_healing: Set[str] = set()
-
-
-def _trigger_probe_heal(model_id: Optional[str], effort: Optional[str]) -> None:
-    """
-    React to a live upstream 400 about the reasoning effort: drop the disproved level
-    from the cache immediately and re-probe that model in the background.
-
-    The request that discovered the problem is never delayed by this.
-
-    对线上"关于思考挡位"的上游 400 作出反应：立即从缓存里剔除被证伪的挡位，并在
-    后台重探该模型。
-
-    发现问题的那个请求绝不因此被拖延。
-    """
-    if not model_id or model_id in _healing:
-        return
-    entry = model_probe.entry(model_id)
-    if entry is not None and not model_probe.invalidate_effort(model_id, effort):
-        # Nothing was disproved (the level was not advertised): no re-probe needed.
-        # 没有被证伪的东西（该挡位本就没被声明）：无需重探。
-        return
-    _healing.add(model_id)
-
-    async def healer() -> None:
-        try:
-            model_probe.save()
-            await _refresh_model_probe()
-        except Exception as exc:  # noqa: BLE001 - background task must not die silently
-            logger.warning(lang.t("probe_task_error", exc=exc))
-        finally:
-            _healing.discard(model_id)
-
-    asyncio.create_task(healer())
 
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     configure_logging(settings)
+    _enforce_listen_safety(settings)
     logger.info("=" * 60)
     logger.info(lang.t("banner_start", version=VERSION))
     logger.info(lang.t("banner_upstream", url=settings.open_webui_base_url))
@@ -945,6 +228,7 @@ async def lifespan(fastapi_app: FastAPI):
     logger.info(lang.t("banner_session", path=settings.session_file))
     logger.info(lang.t("banner_style", style=settings.upstream_api_style))
     logger.info("=" * 60)
+    _log_exposure_summary(settings)
     await _startup_check()
     # Background per-model probe: covers the "first login / empty cache" case as well
     # as plain startups; never blocks the service from serving.
@@ -955,8 +239,7 @@ async def lifespan(fastapi_app: FastAPI):
     try:
         yield
     finally:
-        if _refresh_task is not None and not _refresh_task.done():
-            _refresh_task.cancel()
+        await _shutdown_background_tasks()
         await upstream.aclose()
 
 
@@ -992,6 +275,104 @@ if settings.cors_origins:
 
 
 # --------------------------------------------------------------------------- #
+# Request context: correlation id + response hardening (U-7, U-9)
+# 请求上下文：关联 id + 响应加固（U-7、U-9）
+# --------------------------------------------------------------------------- #
+# Static hardening applied to every response. None of these need per-route decisions:
+# the proxy never serves HTML, and everything it does serve (the upstream address, the
+# probed prefix, the model list) is per-deployment information that must not sit in a
+# shared or browser cache.
+#
+# 对所有响应统一施加的静态加固。它们都不需要逐路由判断：本代理不吐 HTML，而它吐出的
+# 一切（上游地址、探测到的前缀、模型列表）都是部署级信息，不应留在共享缓存或浏览器缓存里。
+_SECURITY_RESPONSE_HEADERS = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"cache-control", b"no-store, private"),
+)
+
+
+def _request_header(scope: Any, name: bytes) -> str:
+    """
+    Read one request header out of an ASGI scope (header names are case-insensitive
+    and conventionally lowercase, but are not required to be).
+
+    从 ASGI scope 中读取一个请求头（头名不区分大小写，习惯上小写，但并不强制）。
+    """
+    for key, value in scope.get("headers") or []:
+        if key.lower() == name:
+            return value.decode("latin-1", errors="replace")
+    return ""
+
+
+class RequestContextMiddleware:
+    """
+    Attach a correlation id to every request and harden every response (U-7, U-9).
+
+    Written as a pure ASGI middleware rather than a BaseHTTPMiddleware one on purpose:
+    this service streams SSE, and the BaseHTTPMiddleware wrapper would put an extra
+    buffering channel in front of every streamed response.
+
+    The id is the client's own X-Request-ID when it supplied a usable one (so a client
+    can match its retry against this service's log), a fresh UUID otherwise. It is
+    bound for the request's context -- every log line the request produces carries it --
+    and echoed back in the response header, so a client reporting "the upstream errored"
+    can be answered by grepping one id.
+
+    为每个请求附上关联 id，并加固每个响应（U-7、U-9）。
+
+    刻意写成纯 ASGI 中间件而不是 BaseHTTPMiddleware：本服务要流式输出 SSE，而
+    BaseHTTPMiddleware 包装层会给每个流式响应前面多插一条缓冲通道。
+
+    id 在客户端提供了可用值时用它的 X-Request-ID（便于客户端把自己的重试与
+    本服务日志对上），否则生成新的 UUID。它绑定在该请求的上下文里——该请求产生的
+    每一行日志都携带它——并在响应头里回显，因此"上游报错了"的反馈只需要 grep 一个 id。
+    """
+
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_id = new_request_id(_request_header(scope, b"x-request-id"))
+        # No reset on the way out: each request is handled in its own task, so the value
+        # cannot leak into another request's context.
+        #
+        # 退出时不做重置：每个请求在自己的任务里处理，该值不会泄漏到别的请求上下文。
+        bind_request_id(request_id)
+
+        async def send_with_context(message: Dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                _harden_response_headers(
+                    message.setdefault("headers", []), request_id
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_context)
+
+
+def _harden_response_headers(headers: List[Any], request_id: str) -> None:
+    """
+    Append the correlation id and the static hardening headers, without overwriting a
+    header the route set itself (the chat SSE route sets its own Cache-Control).
+
+    追加关联 id 与静态加固头，不覆盖路由自己设置的同名头（对话 SSE 路由自带
+    Cache-Control）。
+    """
+    present = {key.lower() for key, _ in headers}
+    if b"x-request-id" not in present:
+        headers.append((b"x-request-id", request_id.encode("latin-1")))
+    for name, value in _SECURITY_RESPONSE_HEADERS:
+        if name not in present:
+            headers.append((name, value))
+
+
+app.add_middleware(RequestContextMiddleware)
+
+
+# --------------------------------------------------------------------------- #
 # Authentication
 # 鉴权
 # --------------------------------------------------------------------------- #
@@ -1002,33 +383,56 @@ def _presented_proxy_key(request: Request) -> str:
     return request.headers.get("X-API-Key", "").strip()
 
 
+def match_proxy_key(presented: str) -> Optional[str]:
+    """
+    Which configured proxy key the request presented, by name; None when it matches
+    none (U-10).
+
+    Every configured key is compared, without an early exit: returning on the first
+    match would make the response time depend on the position of the matching key in
+    the list, which is information a brute-forcer can use. The comparison itself is
+    constant time, as before. Must encode to bytes -- compare_digest raises TypeError
+    on non-ASCII str, which would turn a Chinese key's 401 into a 500.
+
+    请求出示的是哪一把已配置的代理 Key（按名字）；一把都不匹配时返回 None（U-10）。
+
+    每一把已配置的 Key 都会被比较，不提前返回：首个命中即返回会让响应耗时依赖命中
+    Key 在列表中的位置，那是爆破者可以利用的信息。比较本身与以往一样是定长的。
+    必须编码成 bytes：compare_digest 比较含非 ASCII 的 str 会抛 TypeError，
+    那样一个中文 Key 就会把 401 变成 500。
+    """
+    if not presented:
+        return None
+    encoded = presented.encode("utf-8")
+    matched: Optional[str] = None
+    if settings.proxy_api_key and compare_digest(
+        encoded, settings.proxy_api_key.encode("utf-8")
+    ):
+        matched = "default"
+    for name, key in settings.proxy_api_keys.items():
+        if compare_digest(encoded, key.encode("utf-8")):
+            matched = name
+    return matched
+
+
 def is_proxy_key_valid(request: Request) -> bool:
     """
     Whether the request carries a valid proxy key; always True when auth is
-    disabled (PROXY_API_KEY empty).
+    disabled (neither PROXY_API_KEY nor PROXY_API_KEYS provides one).
 
     Kept as a separate layer from require_proxy_key so the meta endpoints (/ and
     /healthz) stay accessible without auth, and only use this result to decide
     whether to expose sensitive fields such as the upstream address.
 
-    请求是否携带有效代理 Key；未启用鉴权（PROXY_API_KEY 为空）时恒为 True。
+    请求是否携带有效代理 Key；未启用鉴权（PROXY_API_KEY 与 PROXY_API_KEYS 都为空）
+    时恒为 True。
 
     与 require_proxy_key 分成两层：元信息端点（/ 与 /healthz）保持免鉴权
     可访问，只根据这个结果决定要不要暴露上游地址等敏感字段。
     """
-    if not settings.proxy_api_key:
+    if not settings.authentication_enabled():
         return True
-    presented = _presented_proxy_key(request)
-    # Use a constant-time comparison to prevent byte-by-byte key brute-forcing via
-    # response timing. Must encode to bytes: compare_digest raises TypeError on
-    # non-ASCII str, which would turn a Chinese key's 401 into a 500.
-    #
-    # 用定长时间比较，避免通过响应耗时逐字节爆破 Key。
-    # 必须编码成 bytes：compare_digest 比较含非 ASCII 的 str 会抛 TypeError，
-    # 那样一个中文 Key 就会把 401 变成 500。
-    return bool(presented) and compare_digest(
-        presented.encode("utf-8"), settings.proxy_api_key.encode("utf-8")
-    )
+    return match_proxy_key(_presented_proxy_key(request)) is not None
 
 
 def require_proxy_key(request: Request) -> None:
@@ -1047,11 +451,18 @@ def openai_error(
     error_type: str = "invalid_request_error",
     code: Optional[str] = None,
     param: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> JSONResponse:
     """
     Return an OpenAI-style error body instead of FastAPI's default {"detail": ...}.
 
+    `headers` carries pass-through response headers -- currently Retry-After from an
+    upstream 429, so clients can back off precisely instead of guessing.
+
     返回 OpenAI 风格的错误体，而不是 FastAPI 默认的 {"detail": ...}。
+
+    `headers` 携带透传的响应头——目前是上游 429 的 Retry-After，
+    让客户端能精确退避而不是靠猜。
     """
     return JSONResponse(
         status_code=status_code,
@@ -1063,30 +474,108 @@ def openai_error(
                 "code": code,
             }
         },
+        headers=headers,
     )
-
-
-class HttpError(Exception):
-    """
-    An error that the exception handler turns into an OpenAI-style error body.
-
-    会被异常处理器转换成 OpenAI 风格错误体的异常。
-    """
-
-    def __init__(self, status_code: int, message: str, **error_fields: Any):
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-        self.error_fields = error_fields
-
-
-def _http_error(status_code: int, message: str, **error_fields: Any) -> HttpError:
-    return HttpError(status_code, message, **error_fields)
 
 
 @app.exception_handler(HttpError)
 async def http_error_handler(request: Request, exc: HttpError) -> JSONResponse:
-    return openai_error(exc.message, exc.status_code, **exc.error_fields)
+    return openai_error(exc.message, exc.status_code, headers=exc.headers, **exc.error_fields)
+
+
+def _upstream_error_message(status: int, text: str) -> str:
+    """
+    The client-facing message for an upstream error. With EXPOSE_UPSTREAM_ERROR
+    disabled (the default) the upstream body stays in the log only, and the client
+    gets a fixed sentence plus the request id that ties it to that log line (U-6).
+
+    上游错误对客户端的消息。EXPOSE_UPSTREAM_ERROR 关闭（默认）时上游响应体只进日志，
+    客户端收到固定语句 + 可用于在日志里定位这次请求的 request id（U-6）。
+    """
+    if settings.expose_upstream_error:
+        return lang.t("err_upstream_http", status=status, text=text)
+    logger.warning(lang.t("err_upstream_http", status=status, text=text))
+    return lang.t("err_upstream_http_redacted", status=status) + request_id_suffix()
+
+
+def _upstream_unavailable_error(exc: UpstreamUnavailable) -> HttpError:
+    """
+    Translate "the upstream could not be reached/handled" into a client-facing error.
+
+    The local detail (host, port, network stack) goes to the log; the client gets it
+    verbatim only when EXPOSE_UPSTREAM_ERROR is on, and otherwise a fixed message plus
+    the request id (U-6).
+
+    把"上游连不上/无法处理"翻译成对客户端的错误。
+
+    本地细节（主机、端口、网络栈）进日志；只有在 EXPOSE_UPSTREAM_ERROR 打开时客户端
+    才会看到原文，否则收到固定文案 + request id（U-6）。
+    """
+    logger.warning(lang.t("upstream_unavailable_log", exc=exc))
+    if settings.expose_upstream_error:
+        message = str(exc)
+    else:
+        message = lang.t("err_upstream_unavailable_redacted") + request_id_suffix()
+    return _http_error(
+        exc.status_code, message, error_type="server_error", code="upstream_unavailable"
+    )
+
+
+def _invalid_request_response(exc: UpstreamRequestInvalid) -> JSONResponse:
+    """
+    A request that could not even be built (a header value the HTTP stack rejects) is a
+    bad request, not a broken upstream (B12): answering 400 with the reason keeps the
+    diagnosis where it belongs instead of hiding it inside a 500.
+
+    The reason itself may quote the offending header -- that is, the credential -- so
+    it goes to the log; the client gets the detail only with EXPOSE_UPSTREAM_ERROR on,
+    and a fixed sentence plus the request id otherwise (U-6).
+
+    构造都构造不出来的请求（HTTP 栈拒绝的头值）属于请求有误，而不是上游故障（B12）：
+    以 400 加原因作答，把诊断留在它该在的地方，而不是塞进 500 里藏起来。
+
+    原因本身可能引用出问题的请求头——也就是凭证——因此它进日志；只有
+    EXPOSE_UPSTREAM_ERROR 打开时客户端才看到细节，否则收到固定语句 + request id（U-6）。
+    """
+    logger.error(lang.t("upstream_request_invalid", exc=exc))
+    if settings.expose_upstream_error:
+        message = lang.t("err_upstream_request_invalid", exc=exc)
+    else:
+        message = lang.t("err_upstream_request_invalid_redacted") + request_id_suffix()
+    return openai_error(
+        message,
+        400,
+        error_type="invalid_request_error",
+        code="invalid_request",
+    )
+
+
+def _passthrough_retry_headers(resp: httpx.Response) -> Optional[Dict[str, str]]:
+    """Retry-After from the upstream (429 and friends) survives the wrapping."""
+    retry_after = resp.headers.get("retry-after")
+    return {"Retry-After": retry_after} if retry_after else None
+
+
+def _as_response_headers(pairs: List[Tuple[str, str]]) -> Any:
+    """
+    Wrap forward_headers' pair list into a Starlette Headers object.
+
+    StreamingResponse only accepts a Mapping (which would silently merge repeated
+    headers) or a Headers instance, whose internal list keeps every occurrence. The
+    credential headers (Set-Cookie, WWW-Authenticate) have already been dropped by
+    forward_headers (U-4); what survives here is ordinary multi-valued headers.
+
+    把 forward_headers 的键值对列表包装成 Starlette 的 Headers 对象。
+
+    StreamingResponse 只接受 Mapping（会把重复头静默合并）或 Headers 实例——
+    后者的内部列表保留每一次出现。凭证类响应头（Set-Cookie、WWW-Authenticate）
+    已被 forward_headers 剔除（U-4）；这里留下的都是普通的多值头。
+    """
+    from starlette.datastructures import Headers as StarletteHeaders
+
+    return StarletteHeaders(
+        raw=[(name.encode("latin-1"), value.encode("latin-1")) for name, value in pairs]
+    )
 
 
 def _session_or_error() -> Any:
@@ -1116,160 +605,6 @@ def _auth_failure_response(status_code: int) -> JSONResponse:
         error_type="invalid_request_error",
         code="upstream_unauthorized",
     )
-
-
-# --------------------------------------------------------------------------- #
-# Model list normalization
-# 模型列表规范化
-# --------------------------------------------------------------------------- #
-# Quantization tokens recognizable in model ids: NVFP4, FP8, FP16, INT8, GPTQ, AWQ, ...
-# 模型名中可识别的量化标识：NVFP4、FP8、FP16、INT8、GPTQ、AWQ 等
-_QUANT_PATTERN = re.compile(
-    r"\b(NVFP4|FP4|FP8|FP16|INT8|INT4|GPTQ(?:-?[0-9]+BIT)?|AWQ|GGUF|Q[0-9](?:_[A-Z0-9]+)*)\b",
-    re.IGNORECASE,
-)
-
-
-def normalize_model(
-    raw: Any, shared_capabilities: Optional[Dict[str, bool]] = None
-) -> Optional[Dict[str, Any]]:
-    """Collapse an upstream model object into the OpenAI model structure.
-
-    Standard fields stay intact; a whitelist of safe, useful extras is preserved
-    when present: name, description, max_model_len (kept for compatibility) plus
-    max_context_length and context_length, and quantization (parsed from the model
-    id). Private upstream fields (user_id, access_grants, permission, urlIdx, ...)
-    are never exposed.
-
-    `capabilities`, `architecture`, `supported_parameters` and `reasoning` are NOT
-    built here: they are established by probing the engine and attached by the
-    caller, because the upstream's own capability dictionary is a deployment-wide
-    default template rather than a fact about the model.
-
-    把上游的模型对象收敛成 OpenAI 的 model 结构。
-
-    标准字段原样保留，另有一份白名单在存在时透出安全且有用的扩展字段：
-    name、description、max_model_len（兼容保留）+ max_context_length/
-    context_length、quantization（从模型名解析）；上游私有字段（user_id、
-    access_grants、permission、urlIdx 等）一律不透出。
-
-    `capabilities`、`architecture`、`supported_parameters`、`reasoning` **不在这里
-    构造**：它们由探测引擎得出、并由调用方附加，因为上游自带的能力字典是部署级的
-    默认模板，而不是关于该模型的事实。
-    """
-    if isinstance(raw, str):
-        return {"id": raw, "object": "model", "created": 0, "owned_by": "openai"}
-
-    if not isinstance(raw, dict):
-        return None
-
-    model_id = raw.get("id") or raw.get("name") or raw.get("model")
-    if not model_id:
-        return None
-
-    info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
-    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
-    openai_obj = raw.get("openai") if isinstance(raw.get("openai"), dict) else {}
-
-    # info.created_at is the model's real creation time; the "created" on the
-    # OpenAI layer is the serving engine's start time, not the model's.
-    #
-    # info.created_at 才是模型真实创建时间；OpenAI 层的 created 是推理引擎
-    # 的启动时间，并非模型本身的。
-    created = info.get("created_at")
-    if created is None:
-        created = raw.get("created")
-    if created is None:
-        created = raw.get("created_at")
-    try:
-        created = int(created)
-    except (TypeError, ValueError):
-        created = 0
-
-    # Prefer the inner engine attribution (e.g. "vllm") over the OpenAI-layer default
-    # 优先取内层引擎归属（如 "vllm"），而非 OpenAI 层的默认值
-    owned_by = openai_obj.get("owned_by") or raw.get("owned_by") or "openai"
-
-    # Standard fields first, then the whitelisted extras: only emitted when the
-    # upstream provides them, so minimal/legacy model objects keep the exact
-    # 4-field OpenAI shape.
-    #
-    # 先标准字段，后白名单扩展：上游提供时才输出，极简/老版本模型对象仍保持
-    # 精确的 4 字段 OpenAI 结构。
-    model: Dict[str, Any] = {
-        "id": str(model_id),
-        "object": "model",
-        "created": created,
-        "owned_by": str(owned_by),
-    }
-
-    # Human-readable name. Upstream keeps it separate from the id (workspace models
-    # use a uuid as id and a friendly name here), and every mainstream provider that
-    # publishes a list of models publishes one too.
-    #
-    # 人类可读的名称。上游把它与 id 分开保存（workspace 模型用 uuid 作 id，友好名放在
-    # 这里），而所有会输出模型列表的主流供应商也都会输出这个字段。
-    name = raw.get("name") or info.get("name")
-    if name:
-        model["name"] = str(name)
-
-    # Generic-template field names; max_model_len stays as a compatibility alias
-    # 通用模板字段名；max_model_len 作为兼容别名保留
-    max_model_len = raw.get("max_model_len") or openai_obj.get("max_model_len")
-    try:
-        context_length = int(max_model_len)
-    except (TypeError, ValueError):
-        context_length = None
-    if context_length is not None:
-        model["max_model_len"] = context_length
-        model["max_context_length"] = context_length
-        model["context_length"] = context_length
-
-    # Quantization is not a dedicated upstream field; parse it from the model id
-    # (e.g. "GLM-5.2-NVFP4" -> "NVFP4"). Omitted when nothing matches.
-    #
-    # 量化信息不是上游的独立字段，从模型名解析（如 "GLM-5.2-NVFP4" ->
-    # "NVFP4"）。匹配不到时不输出该字段。
-    quant_match = _QUANT_PATTERN.search(str(model_id))
-    if quant_match:
-        model["quantization"] = quant_match.group(1).upper()
-
-    description = meta.get("description")
-    if description:
-        model["description"] = str(description)
-
-    own_capabilities = _raw_model_capabilities(raw)
-    template = shared_capabilities or {}
-    deviation = {
-        key: value for key, value in own_capabilities.items() if template.get(key) != value
-    }
-    if deviation:
-        # Open WebUI hands the deployment-wide template to every model, so a model
-        # that deviates from it is worth keeping -- but under the instance namespace,
-        # never inside `capabilities`, which holds probed facts only.
-        #
-        # Open WebUI 把同一份部署级模板发给每个模型，因此偏离模板的模型值得保留——
-        # 但放在实例命名空间下，绝不放进只承载实证事实的 `capabilities`。
-        model["x_open_webui"] = {"capabilities": deviation}
-
-    return model
-
-
-def extract_model_list(payload: Any) -> List[Any]:
-    """
-    Upstream versions return inconsistent shapes: {"data": [...]} / {"items": [...]} / a bare list.
-
-    上游不同版本返回结构不一致：{"data": [...]} / {"items": [...]} / 裸列表。
-    """
-    if isinstance(payload, dict):
-        for key in ("data", "items", "models"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-        return []
-    if isinstance(payload, list):
-        return payload
-    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -1312,18 +647,28 @@ async def healthz(request: Request) -> Dict[str, Any]:
     friendly); the upstream address is likewise only returned when the request
     passes key validation.
 
+    With a valid key it also carries the probe health (U-11): whether the last probe
+    rounds succeeded, whether the credentials are being rejected, and the last
+    recorded failure. Without it, a dead session was only visible as "N probes failed"
+    somewhere in the log.
+
     健康检查。保持免鉴权 200（探针/负载均衡友好），上游地址同样只在
     请求通过 Key 校验时返回。
+
+    带有效 Key 时还会附上探测健康状态（U-11）：最近几轮探测是否成功、凭证是否正被
+    拒绝、以及最近一次失败记录。没有它时，死掉的会话只能从日志里某处的"N 个模型探测
+    失败"间接推断。
     """
     response_body: Dict[str, Any] = {
         "status": "ok",
         "version": VERSION,
         "session_ready": session_exists(settings),
-        "auth_required": bool(settings.proxy_api_key),
+        "auth_required": settings.authentication_enabled(),
     }
     if is_proxy_key_valid(request):
         response_body["upstream"] = settings.open_webui_base_url
         response_body["upstream_prefix"] = upstream.prefix
+        response_body["probe"] = probe_health.to_dict()
     return response_body
 
 
@@ -1346,7 +691,8 @@ def _models_with_probe_fields(
     规范化上游模型列表，并附上探测已确立的一切。
 
     返回规范化后的模型，以及它们的 (id, 引擎指纹) 摘要——刷新路径会复用摘要，
-    避免第二次拉取模型列表。
+    避免第二次拉取模型列表。规范化与指纹推导统一走 _model_summaries，
+    与刷新路径共用同一份定义。
 
     同时刷新实例级的默认能力模板，它是随模型列表免费得到的。
     """
@@ -1354,14 +700,7 @@ def _models_with_probe_fields(
     if shared_capabilities:
         _instance_meta.default_model_capabilities = shared_capabilities
 
-    models: List[Dict[str, Any]] = []
-    summaries: List[Tuple[str, str]] = []
-    for raw in raw_models:
-        model = normalize_model(raw, shared_capabilities)
-        if not model:
-            continue
-        models.append(model)
-        summaries.append((model["id"], _model_fingerprint(raw, model["id"])))
+    models, summaries = _model_summaries(raw_models, shared_capabilities)
 
     model_probe.load()
     for model in models:
@@ -1382,7 +721,7 @@ async def list_models(_: None = Depends(require_proxy_key)) -> Response:
     `x_open_webui` 承载部署自身的元信息。
     """
     session = _session_or_error()
-    raw_models = await _fetch_raw_models(session)
+    raw_models = await _get_raw_models_cached(session)
     await _ensure_instance_meta(session)
     models, summaries = _models_with_probe_fields(raw_models)
 
@@ -1402,9 +741,20 @@ async def list_models(_: None = Depends(require_proxy_key)) -> Response:
     if pending_ids:
         refresh_task = _spawn_model_probe_refresh(summaries=summaries)
         if refresh_task is not None and settings.model_probe_wait > 0:
-            # Let the refresh publish what it is probing before deciding to wait.
-            # 先让刷新任务公布它在探测什么，再决定是否等待。
-            await asyncio.sleep(0)
+            # Wait for the refresh to announce what it is probing. An explicit event
+            # instead of sleep(0): the handshake must survive async steps being added
+            # anywhere between task creation and the announcement. Bounded so a
+            # wedged refresh degrades to "serve immediately".
+            #
+            # 等待刷新公布它正在探测什么。用显式事件而非 sleep(0)：从任务创建到
+            # 公布之间无论新增多少异步步骤，握手都不会静默失效。加上限时，
+            # 刷新卡死时退化为"立即返回"。
+            try:
+                await asyncio.wait_for(
+                    _refresh_state.announcement().wait(), timeout=_PROBE_ANNOUNCE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                pass
             if _refresh_state.pending & set(pending_ids):
                 try:
                     # shield: on timeout only the *wait* is cancelled, the refresh
@@ -1442,7 +792,7 @@ async def retrieve_model(model_id: str, _: None = Depends(require_proxy_key)) ->
     客户端都无法解析的 200。
     """
     session = _session_or_error()
-    raw_models = await _fetch_raw_models(session)
+    raw_models = await _get_raw_models_cached(session)
     models, _ = _models_with_probe_fields(raw_models)
     for model in models:
         if model["id"] == model_id:
@@ -1466,13 +816,23 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
     if payload.get("model"):
         payload["model"] = settings.resolve_model(payload["model"])
 
-    is_stream = bool(payload.get("stream"))
+    # Strict identity, not truthiness (U-5): `{"stream": "false"}` (a non-empty string),
+    # `{"stream": 1}` and `{"stream": []}` all used to flip the request into the
+    # streaming branch, and the client then waited for SSE it never asked for. Only a
+    # real JSON `true` streams -- which is what every OpenAI client sends.
+    #
+    # 严格判等，不用真值（U-5）：`{"stream": "false"}`（非空字符串）、`{"stream": 1}`、
+    # `{"stream": []}` 过去都会把请求翻进流式分支，客户端于是等一个它从没要求的 SSE。
+    # 只有真正的 JSON `true` 才走流式——那正是所有 OpenAI 客户端的发法。
+    is_stream = payload.get("stream") is True
     logger.debug(lang.t("forward_chat", model=payload.get("model"), stream=is_stream))
 
     try:
         resp = await upstream.post(session, "chat/completions", payload, stream=is_stream)
     except UpstreamUnavailable as exc:
-        raise _http_error(exc.status_code, str(exc), error_type="server_error", code="upstream_unavailable") from exc
+        raise _upstream_unavailable_error(exc) from exc
+    except UpstreamRequestInvalid as exc:
+        return _invalid_request_response(exc)
 
     if resp.status_code in AUTH_FAILURE_CODES:
         await resp.aclose()
@@ -1494,10 +854,11 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
                 requested_effort if isinstance(requested_effort, str) else None,
             )
         return openai_error(
-            lang.t("err_upstream_http", status=resp.status_code, text=text),
+            _upstream_error_message(resp.status_code, text),
             resp.status_code if resp.status_code < 500 else 502,
             error_type="invalid_request_error" if resp.status_code < 500 else "server_error",
             code="upstream_error",
+            headers=_passthrough_retry_headers(resp),
         )
 
     if not is_stream:
@@ -1506,8 +867,19 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
         try:
             return JSONResponse(content=json.loads(raw_body))
         except ValueError:
+            # Same policy as the embeddings route (U-6): the body may quote upstream
+            # internals, so it goes to the log and the client gets a fixed sentence.
+            #
+            # 与 embeddings 路由同一套策略（U-6）：响应体可能引用上游内部信息，
+            # 因此它进日志，客户端收到固定语句。
+            logger.warning(lang.t("err_upstream_not_json", body=raw_body[:500]))
+            message = (
+                lang.t("err_upstream_not_json", body=raw_body[:500])
+                if settings.expose_upstream_error
+                else lang.t("err_upstream_not_json_redacted") + request_id_suffix()
+            )
             return openai_error(
-                lang.t("err_upstream_not_json", body=raw_body[:500]),
+                message,
                 502,
                 error_type="server_error",
                 code="upstream_error",
@@ -1521,12 +893,14 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
     #
     # 只补上本代理真正拥有的头。Connection 之类的逐跳头属于协议层（是否复用由 uvicorn 决定），
     # 从上游响应里剔除却又在这里加回来，属于自相矛盾。
-    headers = UpstreamClient.forward_headers(
-        resp,
-        {
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+    headers = _as_response_headers(
+        UpstreamClient.forward_headers(
+            resp,
+            {
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
     )
     return StreamingResponse(
         _sse_iterator(resp, request),
@@ -1556,7 +930,9 @@ async def embeddings(request: Request, _: None = Depends(require_proxy_key)) -> 
     try:
         resp = await upstream.post(session, "embeddings", payload, stream=False)
     except UpstreamUnavailable as exc:
-        raise _http_error(exc.status_code, str(exc), error_type="server_error", code="upstream_unavailable") from exc
+        raise _upstream_unavailable_error(exc) from exc
+    except UpstreamRequestInvalid as exc:
+        return _invalid_request_response(exc)
 
     if resp.status_code in AUTH_FAILURE_CODES:
         await resp.aclose()
@@ -1570,10 +946,11 @@ async def embeddings(request: Request, _: None = Depends(require_proxy_key)) -> 
         text = await _safe_read(resp)
         await resp.aclose()
         return openai_error(
-            lang.t("err_upstream_http", status=resp.status_code, text=text),
+            _upstream_error_message(resp.status_code, text),
             resp.status_code if resp.status_code < 500 else 502,
             error_type="invalid_request_error" if resp.status_code < 500 else "server_error",
             code="upstream_error",
+            headers=_passthrough_retry_headers(resp),
         )
 
     raw_body = await resp.aread()
@@ -1581,8 +958,14 @@ async def embeddings(request: Request, _: None = Depends(require_proxy_key)) -> 
     try:
         content = json.loads(raw_body)
     except ValueError:
+        logger.warning(lang.t("err_upstream_not_json", body=raw_body[:500]))
+        message = (
+            lang.t("err_upstream_not_json", body=raw_body[:500])
+            if settings.expose_upstream_error
+            else lang.t("err_upstream_not_json_redacted") + request_id_suffix()
+        )
         return openai_error(
-            lang.t("err_upstream_not_json", body=raw_body[:500]),
+            message,
             502,
             error_type="server_error",
             code="upstream_error",
@@ -1607,6 +990,21 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
     if not path.strip("/"):
         return openai_error(lang.t("err_passthrough_path"), 404, code="not_found")
 
+    # U-1: the catch-all forwards with the operator's captured credentials attached, so
+    # it now sits behind an allowlist. The default covers the OpenAI-style add-on routes
+    # (images/audio/files/responses); PASSTHROUGH_ALLOW extends or shrinks it, and
+    # PASSTHROUGH_ALLOW=* is the explicit opt-in to the historical forward-everything
+    # behavior.
+    #
+    # U-1：兜底透传会带着运维抓到的凭证转发，因此现在受白名单约束。默认覆盖
+    # OpenAI 风格的附加路由（images/audio/files/responses）；PASSTHROUGH_ALLOW 可增可减，
+    # PASSTHROUGH_ALLOW=* 是对历史上"全量透传"行为的显式选择。
+    if not settings.passthrough_permits(path):
+        logger.warning(lang.t("passthrough_forbidden_log", path=path))
+        return openai_error(
+            lang.t("passthrough_forbidden"), 403, code="passthrough_forbidden"
+        )
+
     session = _session_or_error()
     headers = session.to_headers()
     # The client-declared Content-Type must override the default from to_headers
@@ -1626,16 +1024,18 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
             session, request.method, subpath, headers=headers, content=request_body or None, stream=True
         )
     except UpstreamUnavailable as exc:
-        raise _http_error(
-            exc.status_code, str(exc), error_type="server_error", code="upstream_unavailable"
-        ) from exc
+        raise _upstream_unavailable_error(exc) from exc
+    except UpstreamRequestInvalid as exc:
+        return _invalid_request_response(exc)
 
     if resp.status_code in AUTH_FAILURE_CODES:
         await resp.aclose()
         return _auth_failure_response(resp.status_code)
 
     media_type = resp.headers.get("content-type", "application/json")
-    stream_headers = UpstreamClient.forward_headers(resp, {"X-Accel-Buffering": "no"})
+    stream_headers = _as_response_headers(
+        UpstreamClient.forward_headers(resp, {"X-Accel-Buffering": "no"})
+    )
     return StreamingResponse(
         _sse_iterator(resp, request),
         status_code=resp.status_code,
@@ -1649,8 +1049,60 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
 # 辅助
 # --------------------------------------------------------------------------- #
 async def _read_json_body(request: Request) -> Dict[str, Any]:
+    """
+    Read and parse the JSON request body under a hard size cap (U-2).
+
+    The previous version only looked at a numeric Content-Length, so a chunked request
+    -- which declares no length at all -- was read into memory in full before the cap
+    could apply. The body is now consumed as a stream and the running total is enforced
+    on every chunk, so the cap holds for every request shape; the declared length is
+    still checked first because it rejects an oversized body without reading it.
+
+    在硬性大小上限之下读取并解析 JSON 请求体（U-2）。
+
+    旧实现只看纯数字的 Content-Length，因此不带长度声明的 chunked 请求会被完整读进
+    内存之后上限才可能生效。现在改为流式消费请求体，并在每个分块上核对累计字节数，
+    使上限对任何请求形态都成立；声明长度仍先检查——它能在不读取的前提下直接拒收超大请求体。
+    """
+    declared_length = request.headers.get("content-length", "")
+    if declared_length.isdigit() and int(declared_length) > settings.max_body_bytes:
+        raise _http_error(
+            413,
+            lang.t("err_body_too_large", limit=settings.max_body_bytes),
+            code="body_too_large",
+        )
+
+    chunks: List[bytes] = []
+    total = 0
     try:
-        payload = await request.json()
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > settings.max_body_bytes:
+                # Stop reading: leaving the rest of an oversized body on the wire is the
+                # point -- buffering it first is exactly what this cap exists to prevent.
+                #
+                # 立即停止读取：把超限请求体的剩余部分留在网络上正是重点——先缓冲下来
+                # 恰恰是这个上限要防的事。
+                raise _http_error(
+                    413,
+                    lang.t("err_body_too_large", limit=settings.max_body_bytes),
+                    code="body_too_large",
+                )
+            chunks.append(chunk)
+    except ClientDisconnect as exc:
+        # The client went away mid-body. Without this, the disconnect surfaces as an
+        # unhandled ASGI-level error and lands in the log as a crash, which it is not.
+        #
+        # 客户端在发送请求体途中断开。若不处理，这次断开会以未处理的 ASGI 层错误浮现，
+        # 在日志里被记成一次崩溃——而它并不是。
+        raise _http_error(
+            400, lang.t("err_client_disconnected"), code="client_disconnected"
+        ) from exc
+
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise _http_error(400, lang.t("err_invalid_json"), code="invalid_json")
     if not isinstance(payload, dict):
@@ -1741,7 +1193,53 @@ async def _check_session() -> int:
         return 1
 
     logger.info(lang.t("check_summary", desc=session.describe()))
-    return 0 if await _startup_check() else 1
+    # U-11: --check is exactly when an operator wants to know what the persisted probe
+    # state says -- including the reason the last round failed, which previously was
+    # only visible per-model inside the cache file.
+    #
+    # U-11：运维正需要在这时候知道磁盘上的探测状态是什么——包括上一轮失败的原因，
+    # 它此前只出现在缓存文件里、按模型逐条记录。
+    logger.info(lang.t("check_probe_cache", **probe_cache_status()))
+    return 0 if await _startup_check(quiet_success=True) else 1
+
+
+async def _run_check_cli() -> int:
+    """--check with a bounded client lifetime (B1): the shared httpx client created
+    by the probe must be closed before asyncio.run() tears the loop down."""
+    try:
+        return await _check_session()
+    finally:
+        await upstream.aclose()
+
+
+async def _run_probe_cli() -> int:
+    """--probe with a bounded client lifetime (B1): probes create the shared client
+    many times over; leaving it open until loop shutdown leaks warnings on exit."""
+    try:
+        return 0 if await _refresh_model_probe(force=True) else 1
+    finally:
+        await upstream.aclose()
+
+
+def _preconfigure_language(cli_args: List[str]) -> None:
+    """
+    Honor --lang for argparse's own output (--help): argparse exits during parsing,
+    before the post-parse reconfigure in main(), so argv is scanned up front. Both
+    the space form (--lang zh) and the equals form (--lang=zh) are recognized.
+
+    让 --lang 也能作用于 argparse 自身的输出（--help）：argparse 在解析阶段就会退出，
+    早于 main() 里解析后的重配置，因此先扫一遍 argv。空格形式（--lang zh）与
+    等号形式（--lang=zh）都能识别。
+    """
+    for index, token in enumerate(cli_args):
+        name, separator, value = token.partition("=")
+        if name != "--lang":
+            continue
+        if separator:
+            lang.configure(lang.resolve_language(value))
+        elif index + 1 < len(cli_args):
+            lang.configure(lang.resolve_language(cli_args[index + 1]))
+        break
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1751,10 +1249,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --help 会在参数解析阶段直接退出，晚于下方的重配置；因此先扫一遍 argv，
     # 让 --help 的输出也能跟随 --lang。
     cli_args = list(sys.argv[1:] if argv is None else argv)
-    for index, token in enumerate(cli_args):
-        if token == "--lang" and index + 1 < len(cli_args):
-            lang.configure(lang.resolve_language(cli_args[index + 1]))
-            break
+    _preconfigure_language(cli_args)
 
     parser = argparse.ArgumentParser(description=lang.t("cli_description"))
     parser.add_argument("--login", action="store_true", help=lang.t("cli_login_help"))
@@ -1770,19 +1265,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # --host/--port/--lang require rebuilding settings (the dataclass is frozen)
-    # --host/--port/--lang 需要重新构造 settings（dataclass 是 frozen 的）
+    # --host/--port/--lang require rebuilding settings (the dataclass is frozen).
+    # B3: falsy CLI values must not be swallowed -- "--port 0" is an explicit value,
+    # not "unset". The rebuilt singletons are mirrored into probe_runner, which owns
+    # the runtime state the orchestration functions actually read.
+    #
+    # --host/--port/--lang 需要重新构造 settings（dataclass 是 frozen 的）。
+    # B3：falsy 的 CLI 值不能被吞掉——"--port 0" 是显式赋值，不是"未提供"。
+    # 重建后的单例同步到 probe_runner——编排函数读取的运行时状态以它为准。
     global settings, upstream
-    if args.host or args.port or args.lang != lang.LANG_AUTO:
+    if args.host is not None or args.port is not None or args.lang != lang.LANG_AUTO:
         import dataclasses
 
         settings = dataclasses.replace(
             settings,
-            proxy_host=args.host or settings.proxy_host,
-            proxy_port=args.port or settings.proxy_port,
+            proxy_host=args.host if args.host is not None else settings.proxy_host,
+            proxy_port=args.port if args.port is not None else settings.proxy_port,
             language=lang.resolve_language(args.lang),
         )
         upstream = UpstreamClient(settings)
+        probe_runner.settings = settings
+        probe_runner.upstream = upstream
 
     # Apply the effective language before any user-facing output (logs, banner, errors)
     # 在产生任何用户可见输出（日志、横幅、错误）之前应用生效语言
@@ -1790,7 +1293,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_logging(settings)
 
     if args.check:
-        return asyncio.run(_check_session())
+        return asyncio.run(_run_check_cli())
 
     if args.probe:
         # Force a full probe refresh, synchronously, then exit.
@@ -1803,7 +1306,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except SessionError as exc:
             logger.error(lang.t("creds_unusable", exc=exc))
             return 1
-        return 0 if asyncio.run(_refresh_model_probe(force=True)) else 1
+        return asyncio.run(_run_probe_cli())
 
     if args.login or not session_exists(settings):
         try:

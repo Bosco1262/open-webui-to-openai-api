@@ -4,7 +4,7 @@
 
 Reverse-proxy an **Open WebUI** instance — accessible only via browser login — into an **OpenAI-compatible** API, so that any OpenAI client can connect directly.
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -29,13 +29,13 @@ flowchart LR
 Key points:
 
 - **Credential swapping**: externally it presents your custom `PROXY_API_KEY`, while internally it swaps in the browser-captured `Authorization` / `Cookie` — the upstream never sees your proxy key.
-- **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup — a candidate only counts when it answers with a real model list, so a 5xx or an HTML page is never mistaken for the right prefix — and automatically falls back to the other prefix when a request returns 404 (route not found).
+- **Protocol alignment**: upstream Open WebUI ≥ 0.6 already provides OpenAI-compatible routes `/api/v1/*`; older versions only have the internal routes `/api/*`. This project **auto-detects** and remembers the working prefix at startup — a candidate only counts when it answers with a real model list, so a 5xx or an HTML page is never mistaken for the right prefix — and automatically falls back to the other prefix when a request returns 404 (route not found). If the fallback keeps being the one doing the work (3 calls in a row), the cached prefix is flipped to it, so a deployment that moved its routes stops paying for the extra hop.
 - **Response normalization**: `/v1/models` collapses upstream model objects into the standard `{id, object, created, owned_by}`, plus a whitelist of useful extras: `name`, `description`, `max_context_length` / `context_length` (with `max_model_len` kept as a compatibility alias) and `quantization` (parsed from the model id, e.g. `NVFP4`). Private fields (`user_id`, `access_grants`, `permission`, `urlIdx`, ...) are never exposed.
 - **Probed, not echoed**: `capabilities`, `architecture`, `supported_parameters` and `reasoning` are established by asking the engine (`/v1/models`), never copied from Open WebUI's metadata — see [Per-model probe](#per-model-probe-reasoning-efforts--capabilities). The deployment's own feature switches live in the envelope's `x_open_webui` instead, where they cannot be mistaken for model abilities.
 
 ## Features
 
-- **OpenAI compatible**: `/v1/models`, `/v1/models/{id}`, `/v1/chat/completions` (including streaming SSE), `/v1/embeddings`, plus a catch-all passthrough for unimplemented `/v1/*` paths (with prefix fallback as well).
+- **OpenAI compatible**: `/v1/models`, `/v1/models/{id}`, `/v1/chat/completions` (including streaming SSE), `/v1/embeddings`, plus a catch-all passthrough for unimplemented `/v1/*` paths (with prefix fallback as well) — restricted to an allowlist by default.
 - **Automatic upstream version adaptation**: `auto` / `v1` / `legacy` upstream API styles, with startup probing + per-request fallback.
 - **Robust streaming forwarding**: when the client disconnects, the upstream connection is closed proactively instead of hanging until timeout; hop-by-hop response headers are stripped correctly, and a compressed upstream body (`gzip` / `deflate` / `br` / `zstd`, as supported by the HTTP stack) is decoded before it is handed to the client.
 - **OpenAI-style error bodies**: returns `{"error": {"message", "type", "code"}}` instead of FastAPI's default `{"detail": ...}`, so clients can show the error reason properly.
@@ -43,6 +43,19 @@ Key points:
 - **Optional CORS**: configure `PROXY_CORS_ORIGINS` to let browser pages call this proxy directly (preflight is answered automatically); off by default to keep the exposure surface small.
 - **Model aliases**: map client-requested model names to real upstream model names via `MODEL_ALIASES`.
 - **Redacted credentials**: logs print only the token prefix and length; full credentials never end up in logs.
+- **Hardened by default**: the passthrough is an allowlist rather than "forward everything"; upstream redirects are refused instead of followed with your credentials; the upstream's `Set-Cookie` / `WWW-Authenticate` never reach the client; request bodies are size-capped while being read (chunked included); upstream error details stay in the log; and every request carries a correlation id you can grep.
+
+## Security defaults (at a glance)
+
+| Behaviour | Default | How to change it |
+| --- | --- | --- |
+| `/v1/*` passthrough | allowlist: `images`, `audio`, `files`, `responses` | `PASSTHROUGH_ALLOW=...`, or `PASSTHROUGH_ALLOW=*` for unrestricted |
+| Upstream error text in client errors | hidden (log only, plus a request id) | `EXPOSE_UPSTREAM_ERROR=true` |
+| Upstream 3xx answers | refused (never followed) | point `OPEN_WEBUI_BASE_URL` at the final address |
+| Upstream `Set-Cookie` / `WWW-Authenticate` | stripped | — (clients authenticate with the proxy key) |
+| Plain `http` upstream on a LAN/non-loopback host | accepted, with one startup warning | put a TLS reverse proxy in front, or accept the trusted link |
+| Request body size | capped while reading (`MAX_BODY_BYTES`, 10 MiB) | `MAX_BODY_BYTES` |
+| Response headers | `X-Request-ID`, `Cache-Control: no-store, private`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` | — |
 
 ## Directory Structure
 
@@ -51,11 +64,16 @@ Key points:
 ├── app.py                  # FastAPI routes, OpenAI compatibility layer, CLI entry
 ├── config.py               # All configuration items (env vars / .env)
 ├── lang.py                 # User-facing message localization (zh / en)
+├── models.py               # Model-list normalization + engine fingerprint (pure logic)
 ├── model_probe.py          # Per-model probe: error parsing, probe payloads, cache
+├── probe_runner.py         # Upstream data access + probe orchestration (runtime singletons)
 ├── session_store.py        # Credential load/save + Playwright browser login capture
 ├── upstream.py             # Upstream forwarding: connection pool, prefix probing, streaming
+├── atomic_json.py          # Shared atomic (flush + fsync + rename) JSON writer
+├── request_context.py      # Per-request correlation id (contextvar + log formatter)
 ├── requirements.txt        # Minimal dependencies to run the service
 ├── requirements-browser.txt# Optional: Playwright for browser login
+├── requirements-dev.txt    # Optional: pytest, for running the tests
 ├── .env.example            # Configuration template
 └── tests/
     ├── mock_openwebui.py   # Open WebUI simulator built on the standard library
@@ -67,7 +85,7 @@ Key points:
 
 ### 1. Install dependencies
 
-Python 3.9+:
+Python 3.11+ (the probe-refresh path uses `asyncio.TaskGroup`):
 
 ```bash
 pip install -r requirements.txt
@@ -188,14 +206,16 @@ for await (const part of stream) {
 | Method | Path                   | Auth | Description                                                        |
 | ---- | ---------------------- | -- | ---------------------------------------------------------------- |
 | GET  | `/`                    | No* | Service info and registered endpoints; the upstream address is returned only with a valid key |
-| GET  | `/healthz`             | No* | Health check always 200; upstream address and probed prefix returned only with a valid key |
+| GET  | `/healthz`             | No* | Health check always 200; upstream address, probed prefix and probe health returned only with a valid key |
 | GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure, with probed capabilities / parameters / reasoning attached. The envelope also carries `x_open_webui` with the deployment's own metadata |
 | GET  | `/v1/models/{id}`      | Yes | Retrieve one model (`id` may contain slashes); 404 with an OpenAI-style error body when unknown |
 | POST | `/v1/chat/completions` | Yes | Chat completions, supports `stream: true`                         |
 | POST | `/v1/embeddings`       | Yes | Embeddings (upstream must support them)                           |
-| ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path                   |
+| ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path, limited to `PASSTHROUGH_ALLOW` (default `images`, `audio`, `files`, `responses`); anything else is answered 403 without touching the upstream |
 
-Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`. If `PROXY_API_KEY` is left empty, no auth is enforced.
+Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`, and accepts any of the keys from `PROXY_API_KEY` / `PROXY_API_KEYS`. If both are empty, no auth is enforced.
+
+Every response carries an `X-Request-ID` header: the client's own value when it sent a usable one, a generated id otherwise. The same id is in the service log line, so "this request failed" can be answered by grepping one string. `/healthz` with a valid key also reports the probe health (`status`, consecutive credential rejections, the last round's counters).
 
 Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint does (it has no pagination either; only Anthropic's and Gemini's differently-shaped APIs implement it).
 
@@ -205,13 +225,14 @@ Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint d
 
 | Env var               | Default                 | Description                                                                                          |
 | --------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| `OPEN_WEBUI_BASE_URL` | `http://localhost:8080` | Upstream address, must include `http://` or `https://`, no trailing slash                             |
+| `OPEN_WEBUI_BASE_URL` | `http://localhost:8080` | Upstream address, must include `http://` or `https://`, no trailing slash. Localhost and LAN addresses are first-class; a non-loopback plain-`http` address is accepted and only produces one startup warning (credentials cross that link in cleartext) |
 | `UPSTREAM_API_STYLE`  | `auto`                  | `auto` / `v1` / `legacy`                                                                             |
 | `UPSTREAM_VERIFY_SSL` | `true`                  | Set `false` when the upstream uses a self-signed certificate                                          |
 | `UPSTREAM_TRUST_ENV`  | `true`                  | Whether to honor system proxy env vars; set `false` when the upstream is local/intranet and a system proxy is configured |
 | `PROXY_HOST`          | `0.0.0.0`               | Server listen address (server-side only; `0.0.0.0` = all interfaces, NOT the API address to put in a client) |
 | `PROXY_PORT`          | `8000`                  | Listen port                                                                                          |
 | `PROXY_API_KEY`       | empty                   | Public access key; empty means no auth                                                               |
+| `PROXY_API_KEYS`      | empty                   | Optional named keys instead of one shared key: `name:key` entries, comma-separated (bare entries are auto-named). Lets one client be rotated or revoked on its own; `PROXY_API_KEY` keeps working alongside |
 | `PROXY_CORS_ORIGINS`  | empty                   | Comma-separated list of allowed CORS origins; empty disables CORS                                    |
 | `REQUEST_TIMEOUT`     | `300`                   | Total upstream request timeout (seconds)                                                             |
 | `CONNECT_TIMEOUT`     | `10`                    | Upstream connect timeout (seconds)                                                                   |
@@ -221,6 +242,11 @@ Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint d
 | `MODEL_PROBE_TIMEOUT`     | `30`            | Per-model probe timeout (seconds)                                                                    |
 | `MODEL_PROBE_WAIT`        | `5`             | Max seconds `/v1/models` waits for a probe that is *in flight*; `0` = never wait                     |
 | `EXPOSE_INSTANCE_META`    | `true`          | Whether the `/v1/models` envelope carries `x_open_webui` (turn off for strict clients)               |
+| `EXPOSE_UPSTREAM_ERROR`   | `false`         | Whether upstream error bodies are quoted in the client-facing error message; `false` (default) keeps them in the log only and answers with a fixed message plus the request id |
+| `MAX_BODY_BYTES`          | `10485760`      | Reject JSON request bodies larger than this (413). Enforced while reading, so a chunked body without `Content-Length` is capped too |
+| `MODEL_LIST_TTL`          | `10`            | Seconds the upstream model list is reused before refetching; `0` = fetch on every request            |
+| `ALLOW_INSECURE`          | `false`         | Safety interlock override: permits starting with no proxy key on a non-loopback address              |
+| `PASSTHROUGH_ALLOW`       | `images,audio,files,responses` | Subpaths the `/v1/*` passthrough may forward (exact or subpath match). `*` = unrestricted (the historical behavior); an explicitly empty value denies everything |
 | `MODEL_ALIASES`       | empty                   | JSON object, model name mapping                                                                      |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`; invalid values fall back to `INFO`     |
 | `DEBUG`               | `false`                 | When `true`, equivalent to `LOG_LEVEL=DEBUG`                                                          |
@@ -290,8 +316,11 @@ once, as an instance fact, under the envelope's `x_open_webui`:
 `default_model_capabilities` holds the keys **every** reporting model agrees on; a key
 the upstream does not report uniformly (a deployment had one model without `usage`)
 is left out of the template, and the models that do report it carry their own value in
-that model's `x_open_webui.capabilities`. `/v1/models` stays this shape whether or not
-the template exists, and `EXPOSE_INSTANCE_META=false` removes `x_open_webui` entirely.
+that model's `x_open_webui_deviations.capabilities`. The two keys are deliberately
+different names: `x_open_webui` is the deployment's metadata on the envelope,
+`x_open_webui_deviations` is one model's disagreement with the template inside `data[]`.
+`/v1/models` stays this shape whether or not the template exists, and
+`EXPOSE_INSTANCE_META=false` removes the envelope's `x_open_webui` entirely.
 
 ### How one probe works
 
@@ -304,7 +333,11 @@ output tokens (measured: ~5–100 prompt tokens per request, 5–13 requests per
 | 2. **Per-value verification** | ≤7 | Only a 200 for a concrete level counts. This is what catches the **second** validation layer (gpt-oss's Harmony, Qwen's own parser), which rejects a subset of the first |
 | 3. Request parameters | 1 (+≤3 retries) | One merged request; a 400 is attributed to a parameter and retried without it. Also yields `function_calling` and `structured_outputs` |
 | 4. Vision | 1 | A 1×1 PNG: 400 `"... is not a multimodal model"` means `vision: false` |
-| 5. Default behaviour | 1 | The same request without `reasoning_effort`; whether thinking text comes back gives `default_enabled` |
+| 5. Default behaviour | 1 (0 for an unprobeable model) | The same request without `reasoning_effort`; whether thinking text comes back gives `default_enabled`. When step 1 found the upstream does not validate the field at all, step 3's own 200 already answers this, so the request is skipped |
+
+Every probe request carries `X-WebUI-Proxy-Probe: 1`, so probe traffic can be told
+apart from real chat traffic in the upstream's logs (it shares the same connection
+pool and credentials).
 
 Step 2 is why `supported_efforts` can be trusted. The outer schema is a superset: a
 live Qwen3.8-27B advertises `none/minimal/low/medium/high/xhigh/max`, really accepts
@@ -362,7 +395,15 @@ request. A failed re-probe never discards facts established earlier.
 
 At least one of `authorization` and `cookie` must be present. Keys are matched case-insensitively (and `user_agent` / `User-Agent` are both accepted), so the capitalized form written by older versions keeps working. If you can grab the Open WebUI JWT from the browser DevTools (F12), you can also **write this file by hand** and skip the browser login entirely.
 
-> `session.json` is already listed in `.gitignore` — never commit it. On POSIX systems it is written with `600` permissions automatically.
+`base_url` is the upstream the credentials were captured for, and it is enforced: if
+it does not match the configured `OPEN_WEBUI_BASE_URL`, the file is refused with an
+error naming both addresses. Browser credentials are bound to the site that issued
+them, so reusing them against another instance could only ever produce a confusing
+upstream 401. Trailing slashes and letter case are ignored, and a file without
+`base_url` (written by an older version) is accepted as before. Re-run
+`python app.py --login` after moving to a new upstream.
+
+> `session.json` is already listed in `.gitignore` — never commit it, and never bake it into a container image. It is not a sample file: while it exists it is a **working upstream session**, so keep it out of backups, sync folders and screenshots too. Treat it as a password, and delete it once the session it holds has been retired (after a re-login the old one is useless, and losing it costs nothing but a re-login). POSIX systems get `600` permissions automatically; on Windows it keeps the inherited ACLs, so place it in a user-only directory if the machine is shared. The service prints this reminder whenever it writes the file.
 
 ## Testing
 
@@ -375,9 +416,15 @@ python tests/test_units.py    # Pure-logic unit tests, done in seconds, no netwo
 python tests/test_smoke.py    # End-to-end: mock upstream + real proxy startup
 ```
 
-`test_units.py` covers: credential serialization and legacy-format compatibility, login-signal detection, model-list normalization, config-parsing tolerance, error response shape.
+For pytest (optional, `pip install -r requirements-dev.txt`):
 
-`test_smoke.py` covers: health check, auth rejection, model-list normalization, non-streaming/streaming chat, upstream error passthrough, parameter validation, embeddings, catch-all passthrough, gzip-compressed upstream responses, prefix fallback when the primary candidate answers 5xx, and 503 when credentials are missing — each run against all three upstream styles (`auto` / `v1` / `legacy`).
+```bash
+pytest tests/test_units.py
+```
+
+`test_units.py` covers: credential serialization and legacy-format compatibility, login-signal detection, model-list normalization, the language-key table against the keys the source actually uses, config-parsing tolerance, error response shape, the upstream fallback/heal paths, the accepted upstream address forms (localhost / LAN / private / plain-http / custom-port all pass, only a malformed URL is refused) together with the cleartext-notice predicate, the passthrough allowlist parsing, named proxy keys, request-id sanitizing, probe health state transitions, the request-body cap (declared and chunked), and redirect/credential-header handling. Run directly, it keeps the collected summary output.
+
+`test_smoke.py` covers: health check, auth rejection, model-list normalization, non-streaming/streaming chat, upstream error passthrough (redacted by default, with the request id echoed), parameter validation, embeddings, catch-all passthrough, gzip-compressed upstream responses, prefix fallback when the primary candidate answers 5xx, cookie-only credentials, a session captured for another upstream, 503 when credentials are missing, request-id echo and sanitizing, the security response headers, strict `stream` handling, stripped `Set-Cookie`, a 3xx that is refused rather than followed (verified by the redirect target never being hit), the passthrough allowlist (default / explicit / `*` / empty), the body cap, and named keys — each run against all three upstream styles (`auto` / `v1` / `legacy`). How long a probe scenario waits for the background probe to land defaults to 60s and can be raised on a slow machine with `SMOKE_PROBE_TIMEOUT=180`.
 
 ## Troubleshooting
 
@@ -425,13 +472,54 @@ Reverse proxies (Nginx etc.) need buffering disabled. This project already sends
 
 The browser login step inherently requires human interaction; on a headless server you need a virtual display such as Xvfb. The recommended approach is to log in once locally and copy the generated `session.json` to the server.
 
+**Q: `python app.py --login` stops with a Playwright/browser error**
+
+The two usual causes are a browser that was never downloaded and a machine without a display. Both are reported as one message with the fix instead of a stack trace: run `pip install -r requirements-browser.txt` followed by `playwright install chromium`, and on a machine without a display set `LOGIN_HEADLESS=true` (or run under Xvfb). If neither helps, log in on a desktop machine and copy `session.json` over.
+
+**Q: A `/v1/...` path returns 403 `passthrough_forbidden`**
+
+That route is not in the passthrough allowlist, which defaults to `images,audio,files,responses`. Add the subpath you need (`PASSTHROUGH_ALLOW=responses,images,...`), or set `PASSTHROUGH_ALLOW=*` to forward everything. Remember that every entry lets whoever holds a proxy key use your account on that upstream route.
+
+**Q: Requests fail with "upstream answered a redirect; refusing to follow it"**
+
+The upstream answered a 3xx for a request that carries your credentials. Following it would send those credentials to whatever host the `Location` header names, so the proxy refuses — this is what a deployment that redirects http→https, or a captive portal intercepting traffic, looks like from here. Set `OPEN_WEBUI_BASE_URL` to the final address the redirect points at (and finish any network-portal login first). The log line includes the `Location` value.
+
+**Q: Startup logs "plain http on a non-loopback host"**
+
+That is a notice, not a failure — a LAN Open WebUI (`http://192.168.x.x:3000`) is a perfectly normal setup for this project and keeps working. It exists because `Authorization` and `Cookie` cross that link in cleartext: put a TLS reverse proxy in front when the network is not fully trusted, or ignore it for a segment you control. Loopback addresses never trigger it.
+
+**Q: The error message no longer contains the upstream's own text**
+
+That is the default since 1.1.0 (`EXPOSE_UPSTREAM_ERROR=false`): upstream bodies routinely name internal hosts, paths and network details. Quote the `request id` from the response instead and grep it in the service log, where the full detail is recorded. Set `EXPOSE_UPSTREAM_ERROR=true` if you prefer the old behavior.
+
 ## Security Notes
 
-- Always set `PROXY_API_KEY`; otherwise anyone who can reach the port can borrow your Open WebUI identity.
-- Never commit `session.json` to version control or bake it into container images.
+- Always set `PROXY_API_KEY` (or `PROXY_API_KEYS`); otherwise anyone who can reach the port can borrow your Open WebUI identity.
+- **The proxy key is equivalent to your upstream session — within the passthrough allowlist**: the `/v1/{path}` catch-all forwards requests with the captured browser credentials attached, so a leaked key is as bad as leaking your Open WebUI login itself. The default allowlist (`images`, `audio`, `files`, `responses`) keeps that equivalence to those routes; every path you add widens it, and `PASSTHROUGH_ALLOW=*` restores the unrestricted behavior. The startup log always states which mode is in effect.
+- **Credentials never travel to a redirect target**: the shared upstream client does not follow redirects. A 3xx is reported as an upstream failure and logged with its `Location`, instead of re-sending your `Authorization` / `Cookie` to whatever host it names.
+- **The upstream's session cookies never reach clients**: `Set-Cookie`, `Set-Cookie2` and `WWW-Authenticate` are stripped from upstream responses. Otherwise a login-ish endpoint reachable through the passthrough could hand a client a working upstream session that bypasses this proxy entirely.
+- **Upstream errors no longer name your internals**: with the default `EXPOSE_UPSTREAM_ERROR=false`, the upstream body goes to the log and the client gets a fixed message plus the request id (`X-Request-ID`), which is also on every other response and log line. Set it to `true` if you would rather debug from the client side and accept the extra disclosure.
+- **A cleartext upstream link is reported, not refused**: when `OPEN_WEBUI_BASE_URL` is plain `http` on a non-loopback host, the startup log says so once. Localhost and LAN deployments (`http://192.168.x.x:3000`) are normal, supported setups — the notice only says the credentials travel in cleartext, and suggests a TLS reverse proxy when that matters.
+- As an interlock, the service **refuses to start** when no proxy key is configured and `PROXY_HOST` is a non-loopback address; set `ALLOW_INSECURE=true` to override explicitly.
+- Never commit `session.json` to version control or bake it into container images; while it exists, it is a live credential.
 - Listen on `127.0.0.1` whenever possible; when exposing externally, put a reverse proxy in front and enable HTTPS.
-- This proxy forwards request bodies as-is — do not expose it to untrusted callers.
+- This proxy forwards request bodies as-is (up to `MAX_BODY_BYTES`) — do not expose it to untrusted callers.
 - When enabling CORS (`PROXY_CORS_ORIGINS`), list the minimal set of origins you actually need; avoid `*`.
+- **Single process only**: the proxy keeps per-process state (upstream prefix, probe cache, credential cache). Do not run it with `uvicorn --workers N`.
+
+### Behavior changes in 1.1.0
+
+If you are upgrading from 1.0.x, these defaults changed; each is one env var away from the old behavior:
+
+| Change | Was | Now |
+| --- | --- | --- |
+| `/v1/*` passthrough | everything forwarded | allowlist (`images`, `audio`, `files`, `responses`); `PASSTHROUGH_ALLOW=*` for the old behavior |
+| Upstream error text in client errors | quoted by default | hidden by default (`EXPOSE_UPSTREAM_ERROR=true` to restore) |
+| Upstream 3xx | followed silently | refused (fix `OPEN_WEBUI_BASE_URL` if your deployment redirects) |
+| `stream: "false"` (string) | treated as streaming | treated as non-streaming, like every other non-`true` value |
+| Blocked passthrough paths | 404 | 403 `passthrough_forbidden` |
+
+Nothing else changed shape: localhost and LAN upstreams, `UPSTREAM_VERIFY_SSL=false`, proxy env vars and every timeout/limit keep working exactly as before.
 
 ## Contributing
 

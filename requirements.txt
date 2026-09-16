@@ -6,4 +6,12 @@ fastapi>=0.115,<1.0
 uvicorn>=0.30,<1.0
 httpx>=0.27,<1.0
 python-dotenv>=1.0,<2.0
+# Not imported by this project directly: it is FastAPI's validation engine. It is
+# pinned here on purpose (R13) -- FastAPI itself still accepts the v1 line, so
+# without this constraint which major gets installed would be left to the resolver,
+# while this project only ever runs against v2.
+#
+# 本项目没有直接 import 它：它是 FastAPI 的校验引擎。这里刻意显式锁定（R13）——
+# FastAPI 本身仍接受 v1 系列，若不写这条约束，装到哪个大版本就交给依赖解析器决定，
+# 而本项目只在 v2 上运行。
 pydantic>=2.9,<3.0

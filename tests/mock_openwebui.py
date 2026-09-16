@@ -24,6 +24,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Set
 
 VALID_TOKEN = "mock-jwt-token"
+# The cookie form of the same credential. Open WebUI keeps its JWT in a `token` cookie
+# as well, and a real capture may legitimately carry only that (a browser that never
+# sends an Authorization header), so the mock accepts either (R10).
+#
+# 同一凭证的 Cookie 形式。Open WebUI 也会把 JWT 放在 `token` Cookie 里，真实抓取完全
+# 可能只有它（浏览器从不发送 Authorization 头时），因此模拟器两种都接受（R10）。
+VALID_COOKIE = f"token={VALID_TOKEN}"
 ERROR_MODEL = "boom-model"
 # Requesting this model makes the upstream emit half an SSE stream and then abruptly
 # drop the connection; used to verify tolerance of a stream failing mid-way
@@ -226,6 +233,38 @@ def build_second_layer_error(rules: Dict[str, Any], requested: str) -> str:
     )
 
 
+# A model whose endpoint answers with a redirect carrying a Location back into this
+# same server. The proxy must refuse to follow it (U-3) -- following would re-send the
+# captured credentials -- so the redirected-to path must never be requested. HIT_COUNTS
+# makes that observable from the test.
+#
+# 端点为"带 Location 的重定向"、且 Location 指回本服务器自身的模型。代理必须拒绝跟随
+# （U-3）——跟随便会重发抓到的凭证——因此被指向的路径绝不应收到请求。HIT_COUNTS 让
+# 测试可以观察到这一点。
+REDIRECT_MODEL = "redirect-model"
+REDIRECT_PATH = "/redirect-target"
+
+# A model whose response carries Set-Cookie. The proxy must strip it (U-4): a client
+# authenticates with the proxy key, and a forwarded cookie would hand it a working
+# upstream session that bypasses the proxy entirely.
+#
+# 响应带 Set-Cookie 的模型。代理必须剔除它（U-4）：客户端用代理 Key 鉴权，放过去的
+# Cookie 等于给它一份可绕过本代理的上游会话。
+COOKIE_MODEL = "cookie-model"
+
+# Every path each method actually served, so a test can assert that a path was never
+# requested (the redirect target) -- an end-to-end proof that no follow happened.
+#
+# 各方法实际服务过的每一个路径，使测试可以断言某路径从未被请求（重定向目标）——
+# 这是"没有发生跟随"的端到端证据。
+HIT_COUNTS: Dict[str, int] = {}
+
+
+def _record_hit(method: str, path: str) -> None:
+    key = f"{method} {path}"
+    HIT_COUNTS[key] = HIT_COUNTS.get(key, 0) + 1
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "MockOpenWebUI/1.0"
@@ -327,7 +366,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _authorized(headers: Any) -> bool:
-        return headers.get("Authorization") == f"Bearer {VALID_TOKEN}"
+        """
+        Accept either credential the real upstream accepts: the Bearer token, or the
+        session cookie on its own (R10).
+
+        真实上游接受的两种凭证都放行：Bearer Token，或仅有会话 Cookie（R10）。
+        """
+        if headers.get("Authorization") == f"Bearer {VALID_TOKEN}":
+            return True
+        cookie = headers.get("Cookie") or ""
+        return any(pair.strip() == VALID_COOKIE for pair in cookie.split(";"))
 
     def _read_json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -345,6 +393,7 @@ class _Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------ #
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
+        _record_hit("GET", path)
         # Both handled before the auth check on purpose: a 5xx and the SPA's 200 + HTML
         # page are exactly the answers that say nothing about the credentials.
         #
@@ -392,6 +441,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
+        _record_hit("POST", path)
         if not self._authorized(self.headers):
             self._send_json(401, {"detail": "Not authenticated"})
             return
@@ -464,7 +514,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         gzip 压缩的聊天响应，流式与非流式皆是（见 GZIP_MODEL）。
         """
-        if payload.get("stream"):
+        if payload.get("stream") is True:
             chunks = [
                 'data: {"id":"chat-1","object":"chat.completion.chunk","created":1700000000,'
                 f'"model":{json.dumps(model)},"choices":[{{"index":0,"delta":{{"content":"gzip "}},"finish_reason":null}}]}}\n\n',
@@ -493,12 +543,65 @@ class _Handler(BaseHTTPRequestHandler):
             "application/json",
         )
 
+    def _send_redirect(self, path: str) -> None:
+        """
+        Answer with a 302 pointing back at this same server (U-3).
+
+        The Location is built from the request's own Host header so the target is a
+        real, reachable path here: if the proxy followed the redirect, HIT_COUNTS
+        would show it.
+
+        返回 302，指向本服务器自身（U-3）。
+
+        Location 由请求自带的 Host 头拼成，因此目标是一个真实可达的本地路径：
+        若代理跟随了重定向，HIT_COUNTS 就会记录下来。
+        """
+        host = self.headers.get("Host") or ""
+        self.send_response(302)
+        self.send_header("Location", f"http://{host}{path}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_cookie_chat(self, model: Optional[str]) -> None:
+        """
+        A chat response that tries to hand the client an upstream session cookie (U-4).
+
+        一份试图把上游会话 Cookie 交给客户端的对话响应（U-4）。
+        """
+        body = json.dumps(
+            {
+                "id": "chat-1",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hello cookie"},
+                    }
+                ],
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", f"{VALID_COOKIE}; Path=/; HttpOnly")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_chat(self, payload: Dict[str, Any], model: Optional[str]) -> None:
         if model == ERROR_MODEL:
             self._send_json(400, {"detail": "Model is not available"})
             return
         if model == ABORT_MODEL:
             self._send_sse_then_abort()
+            return
+        if model == REDIRECT_MODEL:
+            self._send_redirect(REDIRECT_PATH)
+            return
+        if model == COOKIE_MODEL:
+            self._handle_cookie_chat(model)
             return
         if model == GZIP_MODEL:
             self._handle_gzip_chat(payload, model)
@@ -550,7 +653,7 @@ class _Handler(BaseHTTPRequestHandler):
             #
             # 推理模型：思考内容用 DeepSeek 事实标准的 reasoning_content 字段，
             # 并在 extra 里回显请求参数，用于验证请求/响应双向无损透传。
-            if payload.get("stream"):
+            if payload.get("stream") is True:
                 self._send_sse(
                     [
                         'data: {"id":"chat-1","object":"chat.completion.chunk","created":1700000000,'
@@ -587,7 +690,7 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
-        if payload.get("stream"):
+        if payload.get("stream") is True:
             self._send_sse(
                 [
                     'data: {"id":"chat-1","object":"chat.completion.chunk","created":1700000000,'

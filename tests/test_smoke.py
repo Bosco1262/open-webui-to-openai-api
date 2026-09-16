@@ -30,14 +30,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mock_openwebui import (  # noqa: E402
     ABORT_MODEL,
     BROKEN_PATHS,
+    COOKIE_MODEL,
     ERROR_MODEL,
     GZIP_MODEL,
+    HIT_COUNTS,
     MODELS,
     NO_TOOLS_MODEL,
+    REDIRECT_MODEL,
+    REDIRECT_PATH,
     REASONING_MODEL,
     TEXT_ONLY_MODEL,
+    VALID_COOKIE,
     VALID_TOKEN,
 )
+
+# How long the scenarios wait for a background probe (or a heal) to become visible.
+# A loaded CI box needs far longer than a workstation, and the previous hardcoded 60s
+# had no way out; override with SMOKE_PROBE_TIMEOUT (seconds).
+#
+# 各场景等待后台探测（或自愈）可见的时长。负载高的 CI 机器比工作站需要长得多，而原先写死的
+# 60 秒无从调整；用 SMOKE_PROBE_TIMEOUT（秒）覆盖。
+def _env_seconds(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+PROBE_POLL_TIMEOUT = _env_seconds("SMOKE_PROBE_TIMEOUT", 60.0)
 
 # A Windows console whose code page cannot represent every character the script prints
 # (cp936 here) would otherwise abort the run with UnicodeEncodeError *after* the last
@@ -93,7 +117,7 @@ class ProxyProcess:
         upstream_url: str,
         session_file: Optional[Path],
         style: str,
-        extra_env: Optional[Dict[str, str]] = None,
+        extra_env: Optional[Dict[str, Optional[str]]] = None,
     ):
         self.port = free_port()
         # Every per-run artifact lives in this run's own directory: the proxy must
@@ -125,7 +149,17 @@ class ProxyProcess:
             }
         )
         if extra_env:
-            env.update(extra_env)
+            for name, value in extra_env.items():
+                # None removes the variable: several scenarios test the built-in
+                # defaults, and an ambient value (a developer shell, CI) must not be
+                # able to change what "the default" means for them.
+                #
+                # 取 None 表示删除该变量：多个场景测的就是内置默认值，环境里已有的取值
+                # （开发机 shell、CI）不得改变"默认值"的含义。
+                if value is None:
+                    env.pop(name, None)
+                else:
+                    env[name] = value
         self._log = open(self.log_file, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(self.port)],
@@ -158,7 +192,7 @@ def headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {PROXY_KEY}"}
 
 
-def make_session(path: Path) -> Path:
+def make_session(path: Path, upstream_url: str) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -166,7 +200,37 @@ def make_session(path: Path) -> Path:
                 "Cookie": "",
                 "User-Agent": "smoke-test-agent",
                 "captured_at": time.time(),
-                "base_url": "mock",
+                # The credentials are captured for one specific upstream, and the proxy
+                # refuses to reuse them anywhere else (D7) -- so this has to be the URL
+                # the proxy is actually started with, not a placeholder.
+                #
+                # 凭证是为某个具体上游抓取的，代理拒绝把它们用在别处（D7）——因此这里必须是
+                # 代理真正启动时使用的 URL，而不是一个占位符。
+                "base_url": upstream_url,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def make_cookie_session(path: Path, upstream_url: str) -> Path:
+    """
+    A session captured from a browser that kept its JWT in a cookie: no Authorization
+    header at all, only the cookie (R10).
+
+    模拟"浏览器把 JWT 存在 Cookie 里"的会话：完全没有 Authorization 头，只有 Cookie（R10）。
+    """
+    path.write_text(
+        json.dumps(
+            {
+                "authorization": "",
+                "cookie": VALID_COOKIE,
+                "user_agent": "smoke-test-agent",
+                "captured_at": time.time(),
+                "base_url": upstream_url,
             },
             ensure_ascii=False,
             indent=2,
@@ -183,9 +247,22 @@ def make_session(path: Path) -> Path:
 def run_case(server_url: str, style: str, expected_prefix: str) -> None:
     print(f"\n=== Scenario: UPSTREAM_API_STYLE={style} / 场景：UPSTREAM_API_STYLE={style} ===")
     tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
-    session_file = make_session(tmp_dir / "session.json")
+    session_file = make_session(tmp_dir / "session.json", server_url)
 
-    proxy = ProxyProcess(server_url, session_file, style)
+    # PASSTHROUGH_ALLOW=* keeps the historical forward-everything behavior for this
+    # general scenario (the allowlist itself is covered by run_passthrough_case), and
+    # EXPOSE_UPSTREAM_ERROR is pinned to its default so the redaction checks below mean
+    # what they say.
+    #
+    # PASSTHROUGH_ALLOW=* 让这个通用场景保持历史上的全量透传行为（白名单本身由
+    # run_passthrough_case 覆盖）；EXPOSE_UPSTREAM_ERROR 固定为默认值，使下面的脱敏
+    # 检查名副其实。
+    proxy = ProxyProcess(
+        server_url,
+        session_file,
+        style,
+        extra_env={"PASSTHROUGH_ALLOW": "*", "EXPOSE_UPSTREAM_ERROR": None},
+    )
     try:
         if not proxy.wait():
             check(f"[{style}] 代理启动", False, proxy.dump_log())
@@ -235,6 +312,44 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         check(
             f"[{style}] 默认不启用 CORS",
             "access-control-allow-origin" not in resp.headers,
+            str(dict(resp.headers)),
+        )
+
+        # 1d. U-7: every response carries a correlation id, and a client-supplied one is
+        #     kept (sanitized) so a client can quote it when reporting a problem.
+        # 1d. U-7：每个响应都带关联 id；客户端提供的会被保留（已清洗），便于反馈问题时引用。
+        resp = client.get("/healthz", headers={"X-Request-ID": "smoke-req-123"})
+        check(
+            f"[{style}] 回显客户端提供的 X-Request-ID",
+            resp.headers.get("x-request-id") == "smoke-req-123",
+            str(resp.headers.get("x-request-id")),
+        )
+        generated = client.get("/healthz").headers.get("x-request-id") or ""
+        check(
+            f"[{style}] 未提供时自动生成 X-Request-ID",
+            len(generated) == 32 and generated.isalnum(),
+            generated,
+        )
+        echoed = (
+            client.get("/healthz", headers={"X-Request-ID": "bad id with spaces"})
+            .headers.get("x-request-id")
+            or ""
+        )
+        check(
+            f"[{style}] 非法的 X-Request-ID 被清洗",
+            echoed == "badidwithspaces",
+            repr(echoed),
+        )
+
+        # 1e. U-9: responses carrying deployment information must not be cached, and the
+        #     static hardening headers are applied everywhere.
+        # 1e. U-9：携带部署信息的响应不得被缓存，静态加固头对所有响应生效。
+        resp = client.get("/healthz")
+        check(
+            f"[{style}] 安全响应头齐备（no-store / nosniff / no-referrer）",
+            resp.headers.get("cache-control") == "no-store, private"
+            and resp.headers.get("x-content-type-options") == "nosniff"
+            and resp.headers.get("referrer-policy") == "no-referrer",
             str(dict(resp.headers)),
         )
 
@@ -355,6 +470,28 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         check(f"[{style}] 流式内容拼接正确", "Hel" in text and "lo from mock" in text, text[:300])
         check(f"[{style}] 流式以 [DONE] 结束", "[DONE]" in text, text[-200:])
 
+        # 5b. U-5: only a real JSON `true` streams. A hand-written client sending the
+        #     string "false" used to be flipped into the streaming branch and waited for
+        #     SSE it never asked for; it must get a complete JSON answer.
+        # 5b. U-5：只有真正的 JSON `true` 才走流式。手写客户端把 "false" 写成字符串时，
+        #     过去会被翻进流式分支、苦等一个它从没要求的 SSE；现在必须拿到完整 JSON。
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={
+                "model": "llama3:latest",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": "false",
+            },
+        )
+        check(
+            f"[{style}] stream 为字符串 \"false\" 时不进入流式",
+            resp.status_code == 200
+            and "application/json" in resp.headers.get("content-type", "")
+            and bool((resp.json() or {}).get("choices")),
+            f"{resp.status_code} {resp.headers.get('content-type')} {resp.text[:120]}",
+        )
+
         # 6. Upstream error passthrough
         # 6. 上游错误透传
         resp = client.post(
@@ -365,6 +502,21 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         body = resp.json()
         check(f"[{style}] 上游错误返回 4xx", resp.status_code == 400, str(body)[:200])
         check(f"[{style}] 上游错误体为 OpenAI 风格", "error" in body, str(body)[:200])
+
+        # 6b. U-6: by default the upstream's error text stays in the log; the client gets
+        #     a fixed message plus the request id that ties it to that log line.
+        # 6b. U-6：默认情况下上游错误原文只进日志；客户端收到固定文案 + 可与日志对上的 request id。
+        check(
+            f"[{style}] 默认不回显上游错误原文",
+            "Model is not available" not in resp.text,
+            resp.text[:200],
+        )
+        check(
+            f"[{style}] 脱敏错误带上可对日志的 request id",
+            bool(resp.headers.get("x-request-id"))
+            and resp.headers.get("x-request-id") in resp.text,
+            f"{resp.headers.get('x-request-id')} / {resp.text[:200]}",
+        )
 
         # 7. Parameter validation
         # 7. 参数校验
@@ -538,6 +690,50 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
             gzip_stream_text[:200],
         )
 
+        # 11. U-4: the upstream's session cookie must never reach the client -- it would
+        #     be a working upstream session that bypasses this proxy entirely.
+        # 11. U-4：上游的会话 Cookie 绝不下发客户端——那会是一份可完全绕过本代理的上游会话。
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={"model": COOKIE_MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            f"[{style}] 上游 Set-Cookie 被剔除",
+            resp.status_code == 200 and "set-cookie" not in resp.headers,
+            f"{resp.status_code} {dict(resp.headers)}",
+        )
+        check(
+            f"[{style}] 剔除 Cookie 后响应体依然可用",
+            (resp.json() or {}).get("choices", [{}])[0]
+            .get("message", {})
+            .get("content")
+            == "hello cookie",
+            resp.text[:160],
+        )
+
+        # 12. U-3: a redirect from the upstream is refused, never followed with the
+        #     captured credentials attached. The mock points Location back at itself, so
+        #     a followed redirect would leave a hit on REDIRECT_PATH.
+        # 12. U-3：上游的重定向被拒绝，绝不带着抓到的凭证跟随。mock 把 Location 指回
+        #     自己，因此一旦发生跟随，REDIRECT_PATH 上就会留下命中记录。
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={"model": REDIRECT_MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            f"[{style}] 上游 3xx 上报为 502 upstream_unavailable",
+            resp.status_code == 502
+            and (resp.json() or {}).get("error", {}).get("code") == "upstream_unavailable",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        check(
+            f"[{style}] 重定向目标从未被请求（凭证未被重发）",
+            HIT_COUNTS.get(f"POST {REDIRECT_PATH}", 0) == 0,
+            str(HIT_COUNTS),
+        )
+
         client.close()
     finally:
         proxy.stop()
@@ -612,7 +808,7 @@ def run_bad_config_case() -> None:
 def run_cors_case(server_url: str) -> None:
     print("\n=== Scenario: CORS (PROXY_CORS_ORIGINS set) / 场景：CORS（PROXY_CORS_ORIGINS 配置了具体来源）===")
     tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
-    session_file = make_session(tmp_dir / "session.json")
+    session_file = make_session(tmp_dir / "session.json", server_url)
     proxy = ProxyProcess(
         server_url,
         session_file,
@@ -675,7 +871,7 @@ def run_cors_case(server_url: str) -> None:
 def run_prefix_5xx_case(server_url: str) -> None:
     print("\n=== Scenario: primary prefix returns 5xx / 场景：主候选前缀返回 5xx ===")
     tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
-    session_file = make_session(tmp_dir / "session.json")
+    session_file = make_session(tmp_dir / "session.json", server_url)
     # Make the first candidate (/api/v1) fail with a 5xx while the legacy /api stays
     # healthy: the proxy must not settle on a prefix it could not confirm, otherwise
     # every request dies on a 502 (the fallback only kicks in on 404).
@@ -713,10 +909,90 @@ def run_prefix_5xx_case(server_url: str) -> None:
         proxy.stop()
 
 
+def run_cookie_only_case(server_url: str) -> None:
+    print("\n=== Scenario: cookie-only credentials / 场景：仅有 Cookie 的凭证 ===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_cookie_session(tmp_dir / "session.json", server_url)
+    proxy = ProxyProcess(server_url, session_file, "v1")
+    try:
+        if not proxy.wait():
+            check("[cookie] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+
+        resp = client.get("/v1/models", headers=headers())
+        models = (resp.json() or {}).get("data") if resp.status_code == 200 else []
+        check(
+            "[cookie] 无 Authorization 头时 /v1/models 依然通过",
+            resp.status_code == 200 and bool(models),
+            f"{resp.status_code} {resp.text[:200]}",
+        )
+
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={"model": "llama3:latest", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "[cookie] 无 Authorization 头时对话依然可用",
+            resp.status_code == 200 and bool((resp.json() or {}).get("choices")),
+            f"{resp.status_code} {resp.text[:200]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_session_base_url_case(server_url: str) -> None:
+    print("\n=== Scenario: session.json captured for another upstream / 场景：凭证属于另一个上游 ===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", "https://another-webui.example.com")
+    proxy = ProxyProcess(server_url, session_file, "v1")
+    try:
+        if not proxy.wait():
+            check("[base-url] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+
+        # D7: reusing credentials captured for another site cannot work, and it used to
+        # surface much later as a confusing upstream 401 -- so the refusal is immediate
+        # and names both addresses.
+        #
+        # D7：为另一个站点抓取的凭证不可能可用，而过去它会在很久之后以令人困惑的
+        # 上游 401 出现——因此这里立即拒绝，并把两个地址都写进错误。
+        resp = client.get("/v1/models", headers=headers())
+        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        check(
+            "[base-url] 上游不一致时拒绝使用凭证",
+            resp.status_code == 500 and body.get("error", {}).get("code") == "session_invalid",
+            f"{resp.status_code} {resp.text[:300]}",
+        )
+        check(
+            "[base-url] 错误信息同时指出两个地址",
+            "another-webui.example.com" in resp.text and server_url in resp.text,
+            resp.text[:300],
+        )
+
+        # The same credentials are accepted once the file is re-captured for this
+        # upstream: the interlock must not be a dead end.
+        #
+        # 把文件按当前上游重新生成后，同一份凭证即可使用：这道联锁不该是死路。
+        make_session(session_file, server_url)
+        resp = client.get("/v1/models", headers=headers())
+        check(
+            "[base-url] 改成一致后恢复正常",
+            resp.status_code == 200,
+            f"{resp.status_code} {resp.text[:200]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
 def run_probe_case(server_url: str) -> None:
     print("\n=== Scenario: per-model probe & cache / 场景：逐模型探测与缓存 ===")
     tmp_dir = Path(tempfile.mkdtemp(prefix="owui-probe-"))
-    session_file = make_session(tmp_dir / "session.json")
+    session_file = make_session(tmp_dir / "session.json", server_url)
     proxy = ProxyProcess(server_url, session_file, "v1")
     # ProxyProcess points the probe cache at this run's own directory, so the smoke
     # tests never touch the checkout's model_probe_cache.json.
@@ -733,7 +1009,7 @@ def run_probe_case(server_url: str) -> None:
         # The startup refresh runs in the background; poll until the probe lands.
         # 启动时的刷新在后台进行；轮询直到探测结果落进 /v1/models。
         models = {}
-        deadline = time.time() + 60
+        deadline = time.time() + PROBE_POLL_TIMEOUT
         while time.time() < deadline:
             body = client.get("/v1/models", headers=headers()).json() or {}
             models = {model.get("id"): model for model in body.get("data") or []}
@@ -860,6 +1136,11 @@ def run_probe_case(server_url: str) -> None:
         )
 
         # --- a live 400 disproves an advertised level and heals the cache -------
+        # The client still gets the same status and OpenAI-style body; the upstream's own
+        # text is redacted by default (U-6) and lives in the server log instead.
+        #
+        # 客户端拿到的状态码与 OpenAI 风格错误体保持不变；上游原文按默认脱敏（U-6），
+        # 只存在于服务端日志里。
         resp = client.post(
             "/v1/chat/completions",
             headers=headers(),
@@ -870,14 +1151,14 @@ def run_probe_case(server_url: str) -> None:
             },
         )
         check(
-            "[probe] 上游 400 原样透出（客户端行为不变）",
+            "[probe] 上游 400 仍以 400 + upstream_error 透出（默认脱敏原文）",
             resp.status_code == 400
             and resp.json().get("error", {}).get("code") == "upstream_error"
-            and "Unexpected reasoning effort high" in resp.text,
+            and "Unexpected reasoning effort" not in resp.text,
             f"{resp.status_code} {resp.text[:160]}",
         )
         healed = None
-        deadline = time.time() + 30
+        deadline = time.time() + PROBE_POLL_TIMEOUT
         while time.time() < deadline:
             body = client.get("/v1/models", headers=headers()).json() or {}
             entry = next((m for m in body.get("data") or [] if m.get("id") == "legacy-model"), {})
@@ -896,6 +1177,237 @@ def run_probe_case(server_url: str) -> None:
             cache_file.exists() and '"version": 2' in (cache_file.read_text(encoding="utf-8") or ""),
         )
 
+        # --- U-11: the probe state is queryable instead of log-only ----------------
+        # --- U-11：探测状态可被查询，而不是只能翻日志 --------------------------------
+        health = client.get("/healthz", headers=headers()).json() or {}
+        probe_view = health.get("probe") or {}
+        check(
+            "[probe] 带 Key 的 /healthz 给出探测健康状态",
+            probe_view.get("status") == "ok"
+            and probe_view.get("consecutive_auth_failures") == 0
+            and isinstance(probe_view.get("last_round"), dict),
+            str(probe_view),
+        )
+        check(
+            "[probe] /healthz 不带 Key 时不暴露探测详情",
+            "probe" not in (client.get("/healthz").json() or {}),
+            str(client.get("/healthz").json()),
+        )
+
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_passthrough_case(server_url: str) -> None:
+    print("\n=== Scenario: passthrough allowlist (U-1) / 场景：透传白名单（U-1）===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", server_url)
+
+    # Unset: the built-in least-privilege default applies.
+    # 不设置：生效的是内置的最小权限默认值。
+    proxy = ProxyProcess(
+        server_url, session_file, "auto", extra_env={"PASSTHROUGH_ALLOW": None}
+    )
+    try:
+        if not proxy.wait():
+            check("[passthrough-default] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+
+        resp = client.post("/v1/responses", headers=headers(), json={"model": "llama3:latest"})
+        check(
+            "[passthrough-default] 默认放行 responses",
+            resp.status_code == 200 and (resp.json() or {}).get("id") == "resp_mock",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        # Counted as a delta: earlier scenarios run with PASSTHROUGH_ALLOW=* and do reach
+        # this route, so an absolute count would prove nothing.
+        #
+        # 按增量统计：更早的场景在 PASSTHROUGH_ALLOW=* 下确实打到过这个路由，
+        # 因此绝对计数说明不了问题。
+        legacy_hits_before = sum(
+            count for key, count in HIT_COUNTS.items() if key.endswith("/legacy-only")
+        )
+        resp = client.post("/v1/legacy-only", headers=headers(), json={"model": "llama3:latest"})
+        legacy_hits_after = sum(
+            count for key, count in HIT_COUNTS.items() if key.endswith("/legacy-only")
+        )
+        check(
+            "[passthrough-default] 默认拒绝未列出的路径（403，且不转发上游）",
+            resp.status_code == 403
+            and (resp.json() or {}).get("error", {}).get("code") == "passthrough_forbidden",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        check(
+            "[passthrough-default] 被拒路径确实没有到达上游",
+            legacy_hits_after == legacy_hits_before,
+            f"before={legacy_hits_before} after={legacy_hits_after}",
+        )
+        check(
+            "[passthrough-default] /healthz 不带 Key 时同样不泄露上游地址",
+            "upstream" not in (client.get("/healthz").json() or {}),
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+    # Explicit list: only the listed subpath is forwarded.
+    # 显式白名单：只有列出的子路径会被转发。
+    proxy = ProxyProcess(
+        server_url, session_file, "auto", extra_env={"PASSTHROUGH_ALLOW": "responses"}
+    )
+    try:
+        if not proxy.wait():
+            check("[passthrough-list] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+        allowed = client.post("/v1/responses", headers=headers(), json={"model": "x"})
+        denied = client.post("/v1/legacy-only", headers=headers(), json={"model": "x"})
+        check(
+            "[passthrough-list] 显式白名单只放行列出的子路径",
+            allowed.status_code == 200 and denied.status_code == 403,
+            f"responses={allowed.status_code} legacy-only={denied.status_code}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+    # Explicitly empty: passthrough off entirely.
+    # 显式空值：兜底透传完全关闭。
+    proxy = ProxyProcess(
+        server_url, session_file, "auto", extra_env={"PASSTHROUGH_ALLOW": ""}
+    )
+    try:
+        if not proxy.wait():
+            check("[passthrough-off] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+        resp = client.post("/v1/responses", headers=headers(), json={"model": "x"})
+        check(
+            "[passthrough-off] 显式空值 = 一律拒绝",
+            resp.status_code == 403,
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_body_limit_case(server_url: str) -> None:
+    print("\n=== Scenario: request body cap (U-2) / 场景：请求体上限（U-2）===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", server_url)
+    proxy = ProxyProcess(
+        server_url,
+        session_file,
+        "auto",
+        extra_env={"MAX_BODY_BYTES": "2048", "PASSTHROUGH_ALLOW": None},
+    )
+    try:
+        if not proxy.wait():
+            check("[body-cap] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
+
+        resp = client.post(
+            "/v1/chat/completions",
+            headers={**headers(), "Content-Type": "application/json"},
+            content=b"x" * 4096,
+        )
+        check(
+            "[body-cap] 声明超限的请求体直接 413",
+            resp.status_code == 413
+            and (resp.json() or {}).get("error", {}).get("code") == "body_too_large",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+
+        def oversized_chunks():
+            # No Content-Length: httpx sends this chunked, which is exactly the shape
+            # that used to slip past the declared-length check.
+            #
+            # 不带 Content-Length：httpx 会以 chunked 发送，而这正是过去能绕过
+            # 声明长度检查的形态。
+            yield b'{"model": "llama3:latest", "messages": [{"role": "user", "content": "'
+            yield b"x" * 4096
+            yield b'"}], "pad": "'
+            yield b"y" * 4096
+            yield b'"}'
+
+        try:
+            chunked = client.post(
+                "/v1/chat/completions",
+                headers={**headers(), "Content-Type": "application/json"},
+                content=oversized_chunks(),
+            )
+            chunked_status = chunked.status_code
+            chunked_code = (chunked.json() or {}).get("error", {}).get("code")
+        except Exception as exc:  # noqa: BLE001 - report what actually happened
+            chunked_status = f"{type(exc).__name__}: {exc}"
+            chunked_code = None
+        check(
+            "[body-cap] 无 Content-Length 的分块请求无法绕过 413",
+            chunked_status == 413 and chunked_code == "body_too_large",
+            f"{chunked_status} / {chunked_code}",
+        )
+
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=headers(),
+            json={"model": "llama3:latest", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "[body-cap] 未超限的请求照常工作",
+            resp.status_code == 200 and bool((resp.json() or {}).get("choices")),
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_multi_key_case(server_url: str) -> None:
+    print("\n=== Scenario: named proxy keys (U-10) / 场景：具名代理 Key（U-10）===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", server_url)
+    # PROXY_API_KEY stays the smoke default, so the legacy single-key path and the
+    # named keys are exercised together in one process.
+    #
+    # PROXY_API_KEY 保持冒烟测试的默认值，使旧的单 Key 路径与具名 Key 在同一进程里一起被验证。
+    proxy = ProxyProcess(
+        server_url,
+        session_file,
+        "auto",
+        extra_env={"PROXY_API_KEYS": "alice:sk-alice,bob:sk-bob"},
+    )
+    try:
+        if not proxy.wait():
+            check("[keys] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=20.0, trust_env=False)
+
+        accepted = {}
+        for name, key in (("legacy", PROXY_KEY), ("alice", "sk-alice"), ("bob", "sk-bob")):
+            resp = client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
+            accepted[name] = resp.status_code
+        check(
+            "[keys] 旧 Key 与全部具名 Key 均可通过鉴权",
+            set(accepted.values()) == {200},
+            str(accepted),
+        )
+        resp = client.get("/v1/models", headers={"Authorization": "Bearer sk-nope"})
+        check(
+            "[keys] 未配置的 Key 返回 401",
+            resp.status_code == 401
+            and (resp.json() or {}).get("error", {}).get("code") == "invalid_api_key",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        resp = client.get("/v1/models", headers={"X-API-Key": "sk-bob"})
+        check(
+            "[keys] X-API-Key 头形态同样可用",
+            resp.status_code == 200,
+            f"{resp.status_code} {resp.text[:160]}",
+        )
         client.close()
     finally:
         proxy.stop()
@@ -916,7 +1428,12 @@ def main() -> int:
         run_missing_session_case(server.base_url)
         run_cors_case(server.base_url)
         run_prefix_5xx_case(server.base_url)
+        run_cookie_only_case(server.base_url)
+        run_session_base_url_case(server.base_url)
         run_probe_case(server.base_url)
+        run_passthrough_case(server.base_url)
+        run_body_limit_case(server.base_url)
+        run_multi_key_case(server.base_url)
     finally:
         server.stop()
 

@@ -56,6 +56,10 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "{name}={raw!r} is not a valid integer, falling back to default {default}",
         "{name}={raw!r} 不是合法整数，回退为默认值 {default}",
     ),
+    "int_below_min": (
+        "{name}={raw!r} is below the minimum {minimum}, falling back to default {default}",
+        "{name}={raw!r} 小于下界 {minimum}，回退为默认值 {default}",
+    ),
     "float_invalid": (
         "{name}={raw!r} is not a valid number, falling back to default {default}",
         "{name}={raw!r} 不是合法数字，回退为默认值 {default}",
@@ -89,6 +93,26 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "http://localhost:8080 or https://webui.example.com (include http:// or https://)",
         "OPEN_WEBUI_BASE_URL={url!r} 不是合法地址，"
         "需要形如 http://localhost:8080 或 https://webui.example.com（记得带 http:// 或 https://）。",
+    ),
+    "upstream_plain_http_warning": (
+        "Upstream {url} is plain http on a non-loopback host: your credentials and chat "
+        "content travel across the network in cleartext. Put a TLS reverse proxy in front, "
+        "or make sure the link is trusted (silenced for loopback addresses, where nothing "
+        "leaves the machine).",
+        "上游 {url} 是非回环主机上的明文 http：凭证与对话内容会以明文过网。请在前面加一层 "
+        "TLS 反向代理，或确认该链路可信（回环地址不提示——它根本不出本机）。",
+    ),
+    "proxy_key_empty": (
+        "PROXY_API_KEYS entry {name!r} has an empty key value; ignoring it",
+        "PROXY_API_KEYS 的条目 {name!r} 密钥为空，已忽略",
+    ),
+    "proxy_keys_duplicate": (
+        "PROXY_API_KEYS defines the name {name!r} more than once; the later value wins",
+        "PROXY_API_KEYS 中名字 {name!r} 重复定义，以靠后的取值为准",
+    ),
+    "request_id_suffix": (
+        " (request id: {request_id})",
+        "（request id：{request_id}）",
     ),
     # ---------------- app.py: startup / banner ----------------
     "startup_failed": (
@@ -200,17 +224,108 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Upstream returned HTTP {status}: {text}",
         "上游返回 HTTP {status}：{text}",
     ),
+    # Used when EXPOSE_UPSTREAM_ERROR=false: the upstream body stays in the log only
+    # EXPOSE_UPSTREAM_ERROR=false 时使用：上游错误体只进日志
+    "err_upstream_http_redacted": (
+        "Upstream returned HTTP {status}.",
+        "上游返回 HTTP {status}。",
+    ),
     "err_upstream_models_http": (
         "Upstream /models returned HTTP {status}: {text}",
         "上游 /models 返回 HTTP {status}：{text}",
+    ),
+    "err_upstream_models_http_redacted": (
+        "Upstream /models returned HTTP {status}.",
+        "上游 /models 返回 HTTP {status}。",
     ),
     "err_upstream_not_json": (
         "Upstream returned invalid JSON: {body!r}",
         "上游返回的不是合法 JSON：{body!r}",
     ),
+    "err_upstream_not_json_redacted": (
+        "Upstream returned invalid JSON.",
+        "上游返回的不是合法 JSON。",
+    ),
     "err_upstream_models_not_json": (
         "Upstream /models returned invalid JSON: {text}",
         "上游 /models 返回的不是合法 JSON：{text}",
+    ),
+    "err_upstream_models_not_json_redacted": (
+        "Upstream /models returned invalid JSON.",
+        "上游 /models 返回的不是合法 JSON。",
+    ),
+    "err_body_too_large": (
+        "Request body exceeds the {limit} byte limit.",
+        "请求体超过 {limit} 字节上限。",
+    ),
+    "err_upstream_request_invalid": (
+        "The request could not be forwarded to the upstream: {exc}",
+        "请求无法转发到上游：{exc}",
+    ),
+    "upstream_request_invalid": (
+        "Request rejected before sending (invalid header value or URL): {exc}",
+        "请求在发出前被拒绝（非法的请求头值或 URL）：{exc}",
+    ),
+    "insecure_listen_refused": (
+        "Refusing to start: PROXY_API_KEY is empty while PROXY_HOST={host!r} listens on a "
+        "non-loopback interface. Set PROXY_API_KEY, bind to 127.0.0.1, or set ALLOW_INSECURE=true "
+        "to override.",
+        "拒绝启动：PROXY_API_KEY 为空且 PROXY_HOST={host!r} 监听在非回环网卡上。"
+        "请设置 PROXY_API_KEY、改绑 127.0.0.1，或显式设置 ALLOW_INSECURE=true 覆盖。",
+    ),
+    "passthrough_forbidden": (
+        "This path is not in PASSTHROUGH_ALLOW; the catch-all passthrough is limited to the "
+        "configured subpaths.",
+        "该路径不在 PASSTHROUGH_ALLOW 中；兜底透传仅限已配置的子路径。",
+    ),
+    "passthrough_forbidden_log": (
+        "Passthrough refused: /v1/{path} is not covered by PASSTHROUGH_ALLOW",
+        "透传被拒绝：/v1/{path} 不在 PASSTHROUGH_ALLOW 覆盖范围内",
+    ),
+    "passthrough_unrestricted": (
+        "PASSTHROUGH_ALLOW=*: the /v1/* catch-all is UNRESTRICTED -- every path is forwarded "
+        "with your captured credentials, so a leaked proxy key is equivalent to your whole "
+        "upstream login.",
+        "PASSTHROUGH_ALLOW=*：/v1/* 兜底透传处于**不设限**状态——任意路径都会带着抓到的凭证"
+        "被转发，因此代理 Key 泄露就等于整个上游登录态泄露。",
+    ),
+    "passthrough_allowlist": (
+        "Passthrough allowlist (/v1/*): {paths}",
+        "兜底透传白名单（/v1/*）：{paths}",
+    ),
+    "passthrough_disabled": (
+        "Passthrough disabled: every /v1/* path outside the implemented routes is refused "
+        "(PASSTHROUGH_ALLOW is empty).",
+        "兜底透传已关闭：除已实现的路由外，所有 /v1/* 路径都会被拒绝（PASSTHROUGH_ALLOW 为空）。",
+    ),
+    "proxy_keys_summary": (
+        "Auth enabled with {count} proxy key(s): {names}",
+        "已启用鉴权，共 {count} 把代理 Key：{names}",
+    ),
+    "upstream_unavailable_log": (
+        "Upstream request failed: {exc}",
+        "上游请求失败：{exc}",
+    ),
+    "err_upstream_unavailable_redacted": (
+        "Cannot reach the Open WebUI upstream; the details are in the server log",
+        "无法连接 Open WebUI 上游，详情见服务端日志",
+    ),
+    "err_upstream_request_invalid_redacted": (
+        "The request could not be forwarded to the upstream (a header value or URL was "
+        "rejected before sending)",
+        "请求无法转发到上游（请求头值或 URL 在发出前被拒绝）",
+    ),
+    "err_client_disconnected": (
+        "The client closed the connection before sending the complete request body.",
+        "客户端在请求体发送完成前断开了连接。",
+    ),
+    "session_unreadable": (
+        "Credential file {path} cannot be read: {exc}",
+        "凭证文件 {path} 无法读取：{exc}",
+    ),
+    "models_prefix_moved": (
+        "Upstream {old}/models answered 404; API prefix re-probed, retrying with {new}",
+        "上游 {old}/models 返回 404；已重探 API 前缀，改用 {new} 重试",
     ),
     "err_model_not_found": (
         "The model '{model}' does not exist",
@@ -250,13 +365,19 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Credential summary: {desc}",
         "凭证摘要：{desc}",
     ),
+    # Angle brackets instead of braces: these strings are shown verbatim (t() skips
+    # formatting when no arguments are given), and braces would look like -- and
+    # collide with -- format placeholders.
+    #
+    # 用尖括号而不是花括号：这些字符串按原文展示（t() 无参时跳过格式化），
+    # 花括号看起来像格式占位符，也会与之冲突。
     "endpoint_passthrough": (
-        "ANY  /v1/{path}  (passthrough)",
-        "ANY  /v1/{path}  (透传)",
+        "ANY  /v1/<path>  (passthrough)",
+        "ANY  /v1/<path>  (透传)",
     ),
     "endpoint_retrieve_model": (
-        "GET  /v1/models/{id}",
-        "GET  /v1/models/{id}",
+        "GET  /v1/models/<id>",
+        "GET  /v1/models/<id>",
     ),
     "cli_description": (
         "Open WebUI -> OpenAI API reverse proxy",
@@ -319,6 +440,35 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Cannot fetch the model list for probing (HTTP {status})",
         "无法获取模型列表以进行探测（HTTP {status}）",
     ),
+    "upstream_models_error_log": (
+        "Upstream /models answered HTTP {status}: {text}",
+        "上游 /models 返回 HTTP {status}：{text}",
+    ),
+    "upstream_models_not_json_log": (
+        "Upstream /models answered a non-JSON body: {text}",
+        "上游 /models 返回的不是 JSON：{text}",
+    ),
+    "probe_auth_rejected_warning": (
+        "Credentials were rejected by the upstream on {count} consecutive probe rounds; run "
+        "`python app.py --login` to log in again.",
+        "凭证已连续 {count} 轮探测被上游拒绝；请运行 `python app.py --login` 重新登录。",
+    ),
+    "probe_health_recovered": (
+        "Credentials are accepted again; probe health is back to ok.",
+        "凭证已恢复可用，探测健康状态回到 ok。",
+    ),
+    "probe_degraded_models": (
+        "the model list could not be fetched",
+        "模型列表无法拉取",
+    ),
+    "check_probe_cache": (
+        "Probe cache: {models} model(s), {inconclusive} inconclusive{detail}",
+        "探测缓存：{models} 个模型，{inconclusive} 个未定性{detail}",
+    ),
+    "check_probe_cache_error": (
+        ", latest error: {error}",
+        "，最近一次错误：{error}",
+    ),
     "probe_task_error": (
         "Probe refresh task crashed: {exc}",
         "探测刷新任务异常终止：{exc}",
@@ -380,6 +530,15 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Credential file {path} has neither Authorization nor Cookie; run `python app.py --login` again.",
         "凭证文件 {path} 里既没有 Authorization 也没有 Cookie，请重新运行 `python app.py --login`。",
     ),
+    "session_base_url_mismatch": (
+        "Credential file {path} was captured for {stored}, which is not the configured upstream "
+        "{configured}. Browser credentials are bound to the site they were captured on, so they "
+        "cannot be reused here: run `python app.py --login` against {configured}, or point "
+        "OPEN_WEBUI_BASE_URL back at {stored}.",
+        "凭证文件 {path} 是为 {stored} 抓取的，与当前配置的上游 {configured} 不一致。"
+        "浏览器凭证与抓取时的站点绑定，无法在此复用：请针对 {configured} 运行 "
+        "`python app.py --login`，或把 OPEN_WEBUI_BASE_URL 改回 {stored}。",
+    ),
     "login_timeout": (
         "Login timed out ({timeout} seconds); no valid credentials captured, please retry.\n"
         "If the browser jumped to a campus/corporate network auth page, finish network authentication "
@@ -396,6 +555,22 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "Browser exited abnormally ({exc}); continuing with captured credentials.",
         "浏览器异常退出（{exc}），使用已抓到的凭证继续。",
     ),
+    "browser_launch_failed": (
+        "Cannot launch the browser: {exc}\n"
+        "  * install the browser once: `pip install -r requirements-browser.txt` then "
+        "`playwright install chromium`;\n"
+        "  * on a machine without a display, set LOGIN_HEADLESS=true (or run under Xvfb);\n"
+        "  * if it still fails, run the login on a desktop machine and copy session.json over.",
+        "无法启动浏览器：{exc}\n"
+        "  * 先安装浏览器：`pip install -r requirements-browser.txt`，再执行 "
+        "`playwright install chromium`；\n"
+        "  * 在无显示器的机器上设置 LOGIN_HEADLESS=true（或改用 Xvfb）；\n"
+        "  * 仍失败时，可在有桌面的机器上登录一次，再把 session.json 拷过去。",
+    ),
+    "browser_context_failed": (
+        "Cannot open a browser context: {exc}",
+        "无法创建浏览器上下文：{exc}",
+    ),
     "login_no_creds": (
         "No credentials captured; check whether you completed the login in the browser.",
         "未能捕获到任何凭证，请检查是否在浏览器中完成了登录。",
@@ -403,6 +578,13 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     "creds_saved": (
         "Credentials saved to {path} ({desc})",
         "凭证已保存到 {path}（{desc}）",
+    ),
+    "creds_live_warning": (
+        "Reminder: {path} holds LIVE credentials (a working upstream session, not a sample). "
+        "Keep it out of backups, sync folders and container images, and delete it once you have "
+        "completed a re-login and no longer need the old session.",
+        "提醒：{path} 里是**可用凭证**（一个能直接使用的上游会话，不是示例文件）。"
+        "不要把它放进备份、同步目录或容器镜像；在重新登录、旧会话不再需要后请删除该文件。",
     ),
     "capture_error_debug": (
         "Error while capturing request headers: {exc}",
@@ -472,6 +654,16 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     "unavailable_base": (
         "Cannot connect to upstream {base}: {exc}",
         "无法连接上游 {base}：{exc}",
+    ),
+    "upstream_redirect_refused": (
+        "Upstream {url} answered a redirect (HTTP {status} -> {location}); refusing to follow "
+        "it with your credentials attached. Point OPEN_WEBUI_BASE_URL at the final address.",
+        "上游 {url} 返回了重定向（HTTP {status} -> {location}）；拒绝带着你的凭证继续跟随。"
+        "请把 OPEN_WEBUI_BASE_URL 直接写成最终地址。",
+    ),
+    "prefix_flipped": (
+        "Cached upstream prefix {old} fell back to {new} {count} times in a row; now using {new}.",
+        "缓存的上游前缀 {old} 连续 {count} 次回退到 {new}，现改为使用 {new}。",
     ),
 }
 

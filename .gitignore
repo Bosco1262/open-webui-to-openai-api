@@ -46,3 +46,4 @@ Thumbs.db
 # Local workbench data (memory / config, not committed)
 # 本地工作台数据（记忆 / 配置，不入库）
 .workbuddy/
+.commandcode/

@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Tuple
 import httpx
 
 import lang
+from atomic_json import atomic_write_json
 from config import DEFAULT_USER_AGENT, Settings
 
 # Playwright is an optional dependency
@@ -151,11 +152,18 @@ class Session:
         """
         Return a redacted credential summary, safe to write into logs.
 
+        The token prefix is shortened to 8 characters: for a JWT that is already almost
+        no information, and for a hand-made token it limits how much of a secret ends up
+        in a log line (R12).
+
         返回脱敏后的凭证摘要，可安全写进日志。
+
+        Token 前缀缩短到 8 个字符：对 JWT 而言本就几乎没有信息量，对手工签发的
+        token 则限制了泄露进日志的密钥长度（R12）。
         """
         parts = []
         if self.authorization:
-            parts.append(f"token={self.authorization[:16]}…(len={len(self.authorization)})")
+            parts.append(f"token={self.authorization[:8]}…(len={len(self.authorization)})")
         if self.cookie:
             parts.append(f"cookie(len={len(self.cookie)})")
         age = self.age_days()
@@ -171,10 +179,17 @@ class Session:
             captured_at = float(captured_at)
         except (TypeError, ValueError):
             captured_at = 0.0
+        # Coerce every header field to str: a hand-edited file may carry numbers or
+        # other non-strings, and is_usable()/to_headers() would otherwise raise
+        # AttributeError/TypeError and turn a bad file into persistent HTTP 500s.
+        #
+        # 所有头字段强制转 str：手工编辑的文件可能带数字等非字符串值，
+        # 否则 is_usable()/to_headers() 会抛 AttributeError/TypeError，
+        # 把一个坏文件变成持续的 HTTP 500。
         return cls(
-            authorization=get("authorization") or "",
-            cookie=get("cookie") or "",
-            user_agent=get("user_agent") or get("user-agent") or "",
+            authorization=str(get("authorization") or ""),
+            cookie=str(get("cookie") or ""),
+            user_agent=str(get("user_agent") or get("user-agent") or ""),
             captured_at=captured_at,
             base_url=str(raw.get("base_url") or ""),
         )
@@ -218,14 +233,71 @@ def _invalidate_session_cache(settings: Settings) -> None:
     _session_cache.pop(str(settings.session_file), None)
 
 
+def _normalize_base_url(value: str) -> str:
+    """
+    Compare upstream addresses the way they are written in practice: a trailing slash
+    or a different case of the scheme/host must not count as a different site.
+
+    按实际书写习惯比较上游地址：结尾多余的斜杠、scheme/host 的大小写差异都不算换了站点。
+    """
+    return value.strip().rstrip("/").lower()
+
+
+def _assert_base_url_matches(settings: Settings, session: Session) -> None:
+    """
+    Refuse credentials captured for a different upstream (D7).
+
+    `base_url` was recorded from the very beginning but never read, so pointing
+    OPEN_WEBUI_BASE_URL at another instance silently reused credentials that cannot
+    work there -- the failure then surfaced much later, as an upstream 401 attributed
+    to an expired token. Browser credentials are bound to the site that issued them,
+    so a mismatch is a configuration error with exactly one fix.
+
+    An empty `base_url` (files written by older versions, or a hand-edited file) is
+    allowed: there is nothing to compare against.
+
+    拒绝为另一个上游抓取的凭证（D7）。
+
+    `base_url` 从一开始就记录在文件里，却从未被读取，于是把 OPEN_WEBUI_BASE_URL 指向
+    另一个实例时会静默复用在那里根本不可能生效的凭证——问题随后才以"上游 401、疑似
+    token 过期"的形式暴露出来。浏览器凭证与签发它的站点绑定，因此不一致属于配置错误，
+    只有一种修法。
+
+    空的 `base_url`（旧版本写出的文件、或手工编辑过的文件）放行：没有可比对的对象。
+    """
+    stored = _normalize_base_url(session.base_url)
+    if not stored:
+        return
+    configured = _normalize_base_url(settings.open_webui_base_url)
+    if stored != configured:
+        raise SessionInvalid(
+            lang.t(
+                "session_base_url_mismatch",
+                path=settings.session_file,
+                stored=session.base_url.strip(),
+                configured=settings.open_webui_base_url,
+            )
+        )
+
+
 def load_session(settings: Settings) -> Session:
     path: Path = settings.session_file
     try:
         stat = path.stat()
-    except OSError as exc:
+    except FileNotFoundError as exc:
         _invalidate_session_cache(settings)
         raise SessionMissing(
             lang.t("session_missing_file", path=path)
+        ) from exc
+    except OSError as exc:
+        # Permission denied, path is a directory, ...: reporting "not found" here
+        # would send the operator down a re-login path that can never fix it.
+        #
+        # 权限拒绝、路径是目录等：报成"文件不存在"会把排障引向
+        # 永远解决不了问题的重新登录路径。
+        _invalidate_session_cache(settings)
+        raise SessionInvalid(
+            lang.t("session_unreadable", path=path, exc=exc)
         ) from exc
 
     key = str(path)
@@ -242,20 +314,36 @@ def load_session(settings: Settings) -> Session:
         _invalidate_session_cache(settings)
         raise SessionInvalid(lang.t("session_wrong_shape", path=path))
 
-    session = Session.from_dict(raw)
+    try:
+        session = Session.from_dict(raw)
+    except Exception as exc:
+        # from_dict is defensive, but a pathological file (e.g. a JSON list with a
+        # dict-shaped tail) must still surface as SessionInvalid, never as 500.
+        #
+        # from_dict 已设防，但病态文件仍须归为 SessionInvalid，而不是 500。
+        _invalidate_session_cache(settings)
+        raise SessionInvalid(
+            lang.t("session_wrong_shape", path=path)
+        ) from exc
     if not session.is_usable():
         _invalidate_session_cache(settings)
         raise SessionInvalid(
             lang.t("session_no_creds", path=path)
         )
+    _assert_base_url_matches(settings, session)
     _session_cache[key] = (stat.st_mtime_ns, stat.st_size, session)
     return session
 
 
 def save_session(settings: Settings, session: Session) -> None:
     path: Path = settings.session_file
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    # Atomic replace with flush + fsync before the rename (R6/D10, shared with the probe
+    # cache): an interrupted write must never leave a half-written credential file
+    # behind, and the rename must not become durable before the bytes it points at.
+    #
+    # 原子替换，且在改名之前 flush + fsync（R6/D10，与探测缓存共用）：写盘中断绝不能
+    # 留下半截凭证文件，改名也不得早于它指向的字节而先持久化。
+    atomic_write_json(path, session.to_dict())
     # Do not rely on the stat check alone: the caller may immediately read the file back
     # within the filesystem's mtime granularity.
     #
@@ -316,7 +404,12 @@ def is_login_signal(url: str, headers: Dict[str, str], api_prefix: str) -> bool:
     - 弱信号：只有 Cookie —— 匿名访问同样会带 Cookie（主题、CSRF 等），
       因此额外要求命中的是必须登录后前端才会调用的接口。
     """
-    if not url.startswith(api_prefix):
+    # Exact prefix, or prefix + "/": a bare startswith would also match sibling
+    # namespaces such as {base}/api-evil or {base}/apiary.
+    #
+    # 精确等于前缀，或前缀 + "/"：裸的 startswith 会把 {base}/api-evil、
+    # {base}/apiary 这类同级命名空间也一并命中。
+    if not (url == api_prefix or url.startswith(api_prefix + "/")):
         return False
 
     lowered = {
@@ -390,6 +483,42 @@ async def _credentials_are_valid(settings: Settings, session: Session) -> bool:
     return False
 
 
+async def _launch_browser(playwright: Any, *, headless: bool) -> Any:
+    """
+    Launch Chromium, turning every failure into a SessionError that carries the fix.
+
+    A browser that was never installed (`playwright install chromium` not run) or a
+    server without a display used to escape as a raw traceback: the caller only handles
+    SessionError, so the operator got a page of Playwright stack instead of the two
+    lines that actually solve it (D9).
+
+    启动 Chromium，并把所有失败翻译成附带解决办法的 SessionError。
+
+    浏览器未安装（没执行过 `playwright install chromium`）或在无显示器的服务器上运行时，
+    异常原先会以裸 traceback 逃出：调用方只处理 SessionError，于是运维看到的是一页
+    Playwright 堆栈，而不是真正能解决问题的两行提示（D9）。
+    """
+    try:
+        return await playwright.chromium.launch(headless=headless)
+    except Exception as exc:  # noqa: BLE001 - every launch failure needs the same hints
+        raise SessionError(lang.t("browser_launch_failed", exc=exc)) from exc
+
+
+async def _open_login_page(browser: Any, settings: Settings) -> Tuple[Any, Any]:
+    """
+    Create the browser context and the page the login is watched in (D9).
+
+    创建登录观察所用的浏览器上下文与页面（D9）。
+    """
+    try:
+        context = await browser.new_context(
+            ignore_https_errors=not settings.upstream_verify_ssl
+        )
+        return await context.new_page(), context
+    except Exception as exc:  # noqa: BLE001 - same treatment as a launch failure
+        raise SessionError(lang.t("browser_context_failed", exc=exc)) from exc
+
+
 async def perform_browser_login(
     settings: Settings,
     *,
@@ -454,62 +583,63 @@ async def perform_browser_login(
             logger.debug(lang.t("capture_error_debug", exc=exc))
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
-        context = await browser.new_context(ignore_https_errors=not settings.upstream_verify_ssl)
-        page = await context.new_page()
-        page.on("request", on_request)
+        browser = await _launch_browser(playwright, headless=headless)
         try:
-            await page.goto(settings.open_webui_base_url, wait_until="domcontentloaded")
-        except Exception as exc:
-            logger.warning(lang.t("goto_failed", exc=exc))
+            page, context = await _open_login_page(browser, settings)
+            page.on("request", on_request)
+            try:
+                await page.goto(settings.open_webui_base_url, wait_until="domcontentloaded")
+            except Exception as exc:
+                logger.warning(lang.t("goto_failed", exc=exc))
 
-        try:
-            deadline = time.monotonic() + timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                await asyncio.wait_for(event.wait(), timeout=remaining)
-                event.clear()
-                # Quiet observation period: login is considered finished only if no
-                # newer credentials arrive during this window
+            try:
+                deadline = time.monotonic() + timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                    event.clear()
+                    # Quiet observation period: login is considered finished only if no
+                    # newer credentials arrive during this window
+                    #
+                    # 静默观察期：期间没有更新的凭证才认为登录流程结束
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=settings.login_quiet_period)
+                    except asyncio.TimeoutError:
+                        pass
+                    # Crucial step: captured credentials must pass a real upstream
+                    # authentication to count as a successful login. Old-token probe
+                    # requests sent early in page load, and old request headers captured
+                    # while a campus portal is unauthenticated, are both stopped here and
+                    # we keep waiting for the user to complete the real login.
+                    #
+                    # 关键一步：抓到的凭证必须能通过上游真实鉴权才算登录成功。
+                    # 页面早期的旧 Token 探测请求、校园网等门户未认证时的旧请求头
+                    # 都会被这里拦下，继续等待用户完成真正的登录。
+                    if await _credentials_are_valid(settings, captured):
+                        break
+                    logger.info(lang.t("validate_failed"))
+                await _enrich_from_browser(page, context, settings, captured)
+            except asyncio.TimeoutError:
+                # The browser is closed by the finally below, which also covers a
+                # failure while opening the context/page.
                 #
-                # 静默观察期：期间没有更新的凭证才认为登录流程结束
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=settings.login_quiet_period)
-                except asyncio.TimeoutError:
-                    pass
-                # Crucial step: captured credentials must pass a real upstream
-                # authentication to count as a successful login. Old-token probe
-                # requests sent early in page load, and old request headers captured
-                # while a campus portal is unauthenticated, are both stopped here and
-                # we keep waiting for the user to complete the real login.
-                #
-                # 关键一步：抓到的凭证必须能通过上游真实鉴权才算登录成功。
-                # 页面早期的旧 Token 探测请求、校园网等门户未认证时的旧请求头
-                # 都会被这里拦下，继续等待用户完成真正的登录。
-                if await _credentials_are_valid(settings, captured):
-                    break
-                logger.info(lang.t("validate_failed"))
-            await _enrich_from_browser(page, context, settings, captured)
-        except asyncio.TimeoutError:
-            await browser.close()
-            raise SessionError(lang.t("login_timeout", timeout=timeout))
-        except SessionError:
-            await browser.close()
-            raise
-        except Exception as exc:
-            # e.g. the user closed the browser directly: continue as long as credentials were captured
-            # 用户直接关掉浏览器等情况：只要抓到了凭证就继续
-            if not captured.is_usable():
-                await browser.close()
-                raise SessionError(lang.t("login_interrupted", exc=exc)) from exc
-            logger.warning(lang.t("login_browser_exit", exc=exc))
+                # 浏览器由下方 finally 统一关闭，它同时覆盖"打开上下文/页面时失败"的情况。
+                raise SessionError(lang.t("login_timeout", timeout=timeout))
+            except SessionError:
+                raise
+            except Exception as exc:
+                # e.g. the user closed the browser directly: continue as long as credentials were captured
+                # 用户直接关掉浏览器等情况：只要抓到了凭证就继续
+                if not captured.is_usable():
+                    raise SessionError(lang.t("login_interrupted", exc=exc)) from exc
+                logger.warning(lang.t("login_browser_exit", exc=exc))
         finally:
             try:
                 if not browser.is_closed():
                     await browser.close()
-            except Exception:  # pragma: no cover
+            except Exception:  # pragma: no cover - closing is best effort
                 pass
 
     if not captured.is_usable():
@@ -517,6 +647,12 @@ async def perform_browser_login(
 
     save_session(settings, captured)
     logger.info(lang.t("creds_saved", path=settings.session_file, desc=captured.describe()))
+    # U-0: this file is not a sample -- it is a working upstream session, with the same
+    # power as the operator's browser login. Say so at the one moment it is written.
+    #
+    # U-0：这个文件不是示例，而是一个能直接用的上游会话，权限等同于运维的浏览器登录态。
+    # 在写出它的那一刻就把这一点讲清楚。
+    logger.warning(lang.t("creds_live_warning", path=settings.session_file))
     return captured
 
 

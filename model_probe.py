@@ -53,12 +53,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from atomic_json import atomic_write_json
 
 logger = logging.getLogger("webui-proxy.probe")
 
@@ -606,6 +607,13 @@ class ModelProbe:
     default_enabled: Optional[bool] = None
     capabilities: Dict[str, bool] = field(default_factory=dict)
     supported_parameters: List[str] = field(default_factory=list)
+    # Effort levels a live upstream 400 has disproved since this engine fingerprint
+    # was established. `record_result` removes them from any newer probe result, so
+    # an earlier-completed probe cannot resurrect a level the engine just rejected.
+    #
+    # 自本引擎指纹确立以来，被线上 400 证伪的挡位。`record_result` 会把它们从
+    # 任何更新的探测结果中剔除，使更早完成的探测无法让刚被拒绝的挡位复活。
+    invalidated_efforts: List[str] = field(default_factory=list)
     # Engine build string reported in chat responses; diagnostics only.
     # 聊天响应里上报的引擎构建串；仅供诊断。
     system_fingerprint: str = ""
@@ -628,6 +636,7 @@ class ModelProbe:
             "default_enabled": self.default_enabled,
             "capabilities": dict(self.capabilities),
             "supported_parameters": list(self.supported_parameters),
+            "invalidated_efforts": list(self.invalidated_efforts),
             "system_fingerprint": self.system_fingerprint,
         }
 
@@ -654,6 +663,7 @@ class ModelProbe:
                 if isinstance(value, bool)
             },
             supported_parameters=[str(v) for v in (parameters or [])],
+            invalidated_efforts=[str(v) for v in (raw.get("invalidated_efforts") or [])],
             system_fingerprint=str(raw.get("system_fingerprint") or ""),
         )
 
@@ -695,24 +705,39 @@ class ModelProbeCache:
         self._path = path
         self._entries: Dict[str, ModelProbe] = {}
         self._loaded = False
+        # (mtime_ns, size) of the file the in-memory state was read from; a replaced
+        # file (hand-edit, external rewrite) is picked up on the next load(), matching
+        # the credential-cache policy in session_store.
+        #
+        # 内存状态读取自文件的 (mtime_ns, size)；文件被替换（手工编辑、外部重写）
+        # 后的下一次 load() 会重新读取，与 session_store 的凭证缓存策略一致。
+        self._loaded_stat: Optional[Tuple[int, int]] = None
 
     def load(self) -> None:
         """
-        Read the cache file (idempotent). A missing, corrupt or older-version file
-        simply starts empty -- a re-probe is annoying, not fatal.
-
-        读取缓存文件（幂等）。文件缺失、损坏或版本较旧时都从空缓存开始——重探一遍
-        很烦，但不致命。
+        Read the cache file (idempotent, but re-read when the file changed on disk).
+        A missing, corrupt or older-version file simply starts empty -- a re-probe is
+        annoying, not fatal. Parse failures are not cached: once fixed, the file is
+        visible on the next load().
         """
-        if self._loaded:
+        try:
+            stat = self._path.stat()
+            current_stat: Optional[Tuple[int, int]] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            current_stat = None
+        if self._loaded and self._loaded_stat == current_stat:
             return
         self._loaded = True
-        if not self._path.exists():
+        self._loaded_stat = current_stat
+        if current_stat is None:
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             logger.warning("probe cache unreadable (%s); starting empty", exc)
+            # Do not cache the failure: a fixed file must be visible immediately.
+            # 不缓存失败：修好的文件必须立即可见。
+            self._loaded_stat = None
             return
         if not isinstance(raw, dict) or raw.get("version") != CACHE_VERSION:
             # Version 1 stored only effort lists and no fingerprint, so its entries
@@ -742,8 +767,9 @@ class ModelProbeCache:
         bails out early when there is no usable session or the model list cannot be
         fetched -- cannot overwrite the on-disk entries with an empty in-memory state.
 
-        The write goes to a temporary file next to the cache and is then moved into
-        place, so an interrupted write cannot leave a half-written cache behind.
+        The write goes to a temporary file next to the cache (flushed and fsynced) and
+        is then moved into place, so an interrupted write cannot leave a half-written
+        cache behind -- see atomic_json.atomic_write_json.
 
         持久化缓存。
 
@@ -751,7 +777,8 @@ class ModelProbeCache:
         任何 /v1/models 请求之前触发，而启动刷新在凭证不可用或模型列表拉取失败时又会
         提前返回），内存中的空状态就会把磁盘上已确立的条目覆盖掉。
 
-        写入先落到旁边的临时文件再原子替换，中途被打断也不会留下半截缓存。
+        写入先落到旁边的临时文件（flush + fsync）再原子替换，中途被打断也不会留下
+        半截缓存——见 atomic_json.atomic_write_json。
         """
         self.load()
         payload = {
@@ -760,12 +787,7 @@ class ModelProbeCache:
                 model_id: probe.to_dict() for model_id, probe in self._entries.items()
             },
         }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_name(self._path.name + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.replace(temporary, self._path)
+        atomic_write_json(self._path, payload)
 
     # ------------------------------------------------------------------ #
     # Reads
@@ -774,6 +796,22 @@ class ModelProbeCache:
     def entry(self, model_id: str) -> Optional[ModelProbe]:
         """The raw cached entry, without interpretation. / 原始缓存条目，不做解释。"""
         return self._entries.get(model_id)
+
+    def inconclusive(self) -> List[ModelProbe]:
+        """
+        Entries whose probe did not reach a conclusion: failed, or partial (some
+        question was left open). Exactly the set worth surfacing when the service
+        misbehaves -- the service's own /healthz probe summary and --check use it
+        (U-11).
+
+        探测未得出结果的条目：失败，或部分成功（仍有问题悬而未决）。服务行为异常时
+        值得浮出来的正是这一批——/healthz 的探测摘要与 --check 都用到它（U-11）。
+        """
+        return [
+            entry
+            for entry in self._entries.values()
+            if entry.status in (STATUS_FAILED, STATUS_PARTIAL)
+        ]
 
     def present(self, model_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -849,13 +887,36 @@ class ModelProbeCache:
         over, so a model whose probe can never be fully resolved backs off instead of
         being re-probed on every request. A conclusive result resets the streak.
 
+        A probe that finished BEFORE the upstream started rejecting a level must not
+        resurrect it: levels in `invalidated_efforts` (recorded by a live 400) are
+        stripped from the incoming result, and the streak of disproved levels carries
+        over while the engine fingerprint stays the same.
+
         保存一次完成的探测尝试。
 
         仍不完整（`partial`）的结果会继承失败计数，使"永远无法完全探清"的模型按
         退避重试，而不是每次请求都重探；结论性结果则清零计数。
+
+        在上游开始拒绝某挡位**之前**完成的探测不得让它复活：
+        `invalidated_efforts`（由线上 400 记录）中的挡位会从新结果中剔除，
+        且在该引擎指纹不变期间，证伪集合会一直延续。
         """
         previous = self._entries.get(model_id)
         same_engine = previous is not None and previous.fingerprint == probe.fingerprint
+        if same_engine and previous.invalidated_efforts:
+            disproved = set(previous.invalidated_efforts)
+            if any(level in probe.supported_efforts for level in disproved):
+                probe.supported_efforts = [
+                    level
+                    for level in probe.supported_efforts
+                    if level not in disproved
+                ]
+                # The merged list is no longer the fully verified result.
+                # 合并后的列表不再是完整实证的结果。
+                probe.efforts_verified = False
+            probe.invalidated_efforts = list(previous.invalidated_efforts)
+        elif not same_engine:
+            probe.invalidated_efforts = []
         if probe.status == STATUS_PARTIAL:
             probe.attempts = (previous.attempts if same_engine else 0) + 1
             probe.retry_after = time.time() + backoff_seconds(probe.attempts)
@@ -917,11 +978,25 @@ class ModelProbeCache:
         if effort not in entry.supported_efforts:
             return False
         entry.supported_efforts = [v for v in entry.supported_efforts if v != effort]
+        # Remember the disproval for the lifetime of this engine fingerprint, so a
+        # probe result that completed before the rejection cannot bring the level
+        # back (see record_result).
+        #
+        # 在该引擎指纹的生命周期内记住证伪，使证伪之前完成的探测结果
+        # 无法把该挡位带回来（见 record_result）。
+        if effort not in entry.invalidated_efforts:
+            entry.invalidated_efforts.append(effort)
         if entry.default_effort == effort:
             # The default cannot be a level the engine just rejected.
             # 默认值不可能是一个刚被引擎拒绝的挡位。
             entry.default_effort = None
         entry.status = STATUS_PARTIAL
+        # The list is no longer the fully verified result: a level was disproved
+        # after the fact, so the flag must not keep claiming completeness.
+        #
+        # 该列表已不再是完整实证的结果：有挡位在事后被证伪，
+        # 这个标志不得继续声称完整。
+        entry.efforts_verified = False
         entry.retry_after = 0.0
         entry.last_error = f"upstream rejected reasoning_effort={effort!r}"
         logger.info(

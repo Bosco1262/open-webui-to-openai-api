@@ -1,0 +1,4 @@
+# Development-only dependencies (testing). Not needed to run the service.
+# 仅开发所需的依赖（测试）。运行服务不需要本文件。
+-r requirements.txt
+pytest>=8.0

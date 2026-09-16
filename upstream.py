@@ -18,8 +18,10 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -32,6 +34,26 @@ logger = logging.getLogger("webui-proxy.upstream")
 # Upstream statuses meaning "this route exists; the credentials are the problem"
 # 表示"该路由存在，问题出在凭证"的上游状态码
 AUTH_FAILURE_CODES = (401, 403)
+
+# Failures that mean "this process could not even produce a valid request" -- a header
+# value httpx cannot encode (it encodes request headers as ASCII, so a non-ASCII
+# Authorization raises UnicodeEncodeError), a URL it rejects -- as opposed to "the
+# upstream is unwell". They are deterministic: retrying another prefix cannot help, and
+# reporting them as 500 would blame the upstream for a local mistake (B12).
+#
+# 表示"本进程连一个合法请求都构造不出来"的失败——httpx 无法编码的头值（请求头按 ASCII
+# 编码，因此非 ASCII 的 Authorization 会抛 UnicodeEncodeError）、它拒绝的 URL——
+# 而不是"上游有问题"。它们是确定性的：换前缀重试没有意义，报成 500 则是把本地错误
+# 归咎于上游（B12）。
+LOCAL_REQUEST_ERRORS = (httpx.InvalidURL, httpx.LocalProtocolError, UnicodeError)
+
+# How many consecutive fallbacks to another candidate prefix before the cached prefix is
+# flipped to the one that is actually answering (D12). One fallback is normal during a
+# migration window; a steady stream of them means the cache is simply wrong.
+#
+# 连续多少次回退到其它候选前缀后，把缓存前缀翻转为真正在应答的那一个（D12）。迁移窗口
+# 内偶发一次回退很正常；持续不断地回退则说明缓存本身就是错的。
+PREFIX_FLIP_THRESHOLD = 3
 
 # The instance-metadata fetch (/api/config) is a bonus, never a requirement: it must not
 # be able to hold /v1/models hostage for REQUEST_TIMEOUT seconds when the upstream
@@ -72,6 +94,19 @@ HOP_BY_HOP_HEADERS = {
 # 由本服务自己生成，不应从上游透传，否则会出现 Date/Server 重复
 SELF_GENERATED_HEADERS = {"date", "server"}
 
+# Response headers carrying the upstream's own session state. They are stripped (U-4):
+# a client authenticates with the proxy key and needs nothing else, while a forwarded
+# Set-Cookie would hand it a working upstream session that bypasses this proxy -- its
+# key check, its logging and its passthrough allowlist -- turning "the proxy key leaked"
+# into "the whole upstream account leaked". The login-ish endpoints reachable through
+# the /v1/* passthrough are exactly the ones that would do this.
+#
+# 承载上游自身会话状态的响应头，一律剔除（U-4）：客户端用代理 Key 鉴权，不需要别的；
+# 而放过去一个 Set-Cookie 就等于把一份可独立使用的上游会话交给它，绕过本代理的
+# Key 校验、日志与透传白名单，把"代理 Key 泄露"升级成"上游账号泄露"。经 /v1/*
+# 兜底透传可达的那些登录类端点，正是会这么干的地方。
+CREDENTIAL_RESPONSE_HEADERS = {"set-cookie", "set-cookie2", "www-authenticate"}
+
 
 class UpstreamUnavailable(RuntimeError):
     """
@@ -85,11 +120,91 @@ class UpstreamUnavailable(RuntimeError):
         self.status_code = status_code
 
 
+class UpstreamRequestInvalid(RuntimeError):
+    """
+    The request could not be built or sent at all: an invalid header value, a URL the
+    HTTP stack rejects.
+
+    Distinct from UpstreamUnavailable on purpose -- this is a deterministic local
+    failure, so retrying another prefix is pointless and it must reach the caller as a
+    4xx (a bad request) rather than a 5xx (a broken upstream).
+
+    请求根本没能构造或发出：非法的请求头值、HTTP 栈拒绝的 URL。
+
+    刻意与 UpstreamUnavailable 区分：这是确定性的本地失败，换前缀重试毫无意义，
+    而且必须以 4xx（请求有误）而不是 5xx（上游故障）抵达调用方。
+    """
+
+
+def _most_informative_status(statuses: List[int]) -> int:
+    """
+    Pick the status that best explains why no candidate prefix could be confirmed:
+    an auth failure means the route exists and the credentials are the problem; a 5xx
+    means the upstream is unwell; anything else (404, a 200 that is not a model list)
+    says the least. 404 as the very last resort.
+    """
+    for status in statuses:
+        if status in AUTH_FAILURE_CODES:
+            return status
+    for status in statuses:
+        if 500 <= status < 600:
+            return status
+    for status in statuses:
+        if status != 404:
+            return status
+    return statuses[0] if statuses else 404
+
+
+async def _close_response(response: httpx.Response) -> None:
+    """Close a response unless it is already closed. / 关闭响应（若尚未关闭）。"""
+    if not response.is_closed:
+        await response.aclose()
+
+
+async def _reject_redirect(response: httpx.Response, url: str) -> None:
+    """
+    Refuse a 3xx answer instead of following it (U-3).
+
+    The shared client does not follow redirects: doing so would re-send the request --
+    Authorization and Cookie included -- to whatever host the `Location` header names,
+    which is a credential-exfiltration primitive whenever the upstream (or anything
+    that can answer for it) redirects. A 3xx is therefore reported as an upstream
+    failure; the fix is to write the final address into OPEN_WEBUI_BASE_URL.
+
+    拒绝 3xx 回答而不是跟随（U-3）。
+
+    共享客户端不跟随重定向：跟随会把这次请求——连同 Authorization 与 Cookie——
+    重发给 `Location` 指向的任意主机；只要上游（或任何能替它应答的东西）回一个
+    重定向，这就是一个凭证外泄原语。因此 3xx 一律上报为上游故障，正确的修法是把
+    最终地址写进 OPEN_WEBUI_BASE_URL。
+    """
+    if not 300 <= response.status_code < 400:
+        return
+    location = response.headers.get("location", "")
+    status = response.status_code
+    await _close_response(response)
+    raise UpstreamUnavailable(
+        lang.t("upstream_redirect_refused", url=url, status=status, location=location)
+    )
+
+
 class UpstreamClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client: Optional[httpx.AsyncClient] = None
         self.prefix: Optional[str] = None
+        # Lazily created (see _prefix_mutex): an asyncio primitive built at import time
+        # would belong to a loop that asyncio.run()/uvicorn never uses.
+        #
+        # 惰性创建（见 _prefix_mutex）：import 期构造的 asyncio 原语会绑定到一个
+        # asyncio.run()/uvicorn 都不会使用的循环上。
+        self._prefix_lock: Optional[asyncio.Lock] = None
+        # Consecutive requests served by a fallback (non-primary) prefix; drives the
+        # prefix flip in _note_prefix_served (D12).
+        #
+        # 连续多少次请求由回退（非主）前缀应答；驱动 _note_prefix_served 里的
+        # 前缀翻转（D12）。
+        self._fallback_streak = 0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -103,7 +218,14 @@ class UpstreamClient:
                     connect=self.settings.connect_timeout,
                 ),
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-                follow_redirects=True,
+                # Redirects are never followed (U-3): the request carries the captured
+                # credentials, so following one would offer them to the redirect target.
+                # See _reject_redirect for the reasoning; this also matches what the
+                # browser-login validation already does.
+                #
+                # 绝不跟随重定向（U-3）：请求带着抓到的凭证，跟随就等于把它们送给重定向
+                # 目标。理由见 _reject_redirect；这也与浏览器登录校验的行为保持一致。
+                follow_redirects=False,
                 verify=self.settings.upstream_verify_ssl,
                 trust_env=self.settings.upstream_trust_env,
             )
@@ -114,6 +236,18 @@ class UpstreamClient:
             await self._client.aclose()
         self._client = None
 
+    def _prefix_mutex(self) -> asyncio.Lock:
+        """
+        The prefix-probe mutex, created on first use (same reasoning as the refresh
+        mutex in probe_runner): the lock must belong to the loop that actually uses it.
+
+        前缀探测互斥锁，首次使用时创建（理由同 probe_runner 里的刷新锁）：
+        锁必须属于真正使用它的事件循环。
+        """
+        if self._prefix_lock is None:
+            self._prefix_lock = asyncio.Lock()
+        return self._prefix_lock
+
     # ------------------------------------------------------------------ #
     # Prefix probing
     # 前缀探测
@@ -123,12 +257,59 @@ class UpstreamClient:
         Determine the upstream prefix. A 404 means the route does not exist;
         401/403 means the route exists but the credentials are dead.
 
+        Concurrent callers share one probe (D3): the startup probe covers the normal
+        path, but once it has failed (UpstreamUnavailable) the first burst of requests
+        would otherwise each run the full candidate sweep against a dead upstream.
+
         确定上游前缀。返回 404 表示该路由不存在，401/403 表示路由存在但凭证失效。
+
+        并发调用共用一次探测（D3）：正常情况下启动探测已经覆盖，但启动探测失败
+        （UpstreamUnavailable）后，首批并发请求否则会各自对死掉的上游跑一整轮候选探测。
         """
         if self.prefix and not refresh:
             return self.prefix
-        prefix, _status = await self.probe_prefix(session)
-        return prefix
+        async with self._prefix_mutex():
+            # Re-check inside the lock: the probe that just finished may already have
+            # settled the prefix for everyone queued behind it.
+            #
+            # 在锁内复查：刚刚完成的那次探测可能已经替所有排队者定下了前缀。
+            if self.prefix and not refresh:
+                return self.prefix
+            prefix, _status = await self.probe_prefix(session)
+            return prefix
+
+    def _note_prefix_served(self, candidate: str, index: int) -> None:
+        """
+        Record which candidate prefix actually served the request (D12).
+
+        The cached prefix is only re-probed when it answers 404, so a deployment that
+        has permanently moved pays one wasted request (and one log line) per call until
+        the process restarts. After PREFIX_FLIP_THRESHOLD consecutive fallbacks the
+        cache is flipped to the prefix doing the work, so the next restart of that
+        streak stops there instead of accumulating forever.
+
+        记录最终是哪个候选前缀真正提供了服务（D12）。
+
+        缓存前缀只在返回 404 时才会重探，因此永久迁移过的部署在进程重启前会为每次调用
+        白付一次请求（和一行日志）。连续回退达到 PREFIX_FLIP_THRESHOLD 次后，把缓存
+        翻转为真正在工作的前缀，使这一连串回退到此为止，而不是无限累积。
+        """
+        if index == 0:
+            self._fallback_streak = 0
+            return
+        self._fallback_streak += 1
+        if self._fallback_streak < PREFIX_FLIP_THRESHOLD or self.prefix == candidate:
+            return
+        logger.warning(
+            lang.t(
+                "prefix_flipped",
+                old=self.prefix,
+                new=candidate,
+                count=PREFIX_FLIP_THRESHOLD,
+            )
+        )
+        self.prefix = candidate
+        self._fallback_streak = 0
 
     async def probe_prefix(self, session: Session) -> tuple[str, int]:
         """
@@ -159,15 +340,20 @@ class UpstreamClient:
         """
         candidates: List[str] = self.settings.prefix_candidates()
         client = await self.client()
-        last_status: Optional[int] = None
+        candidate_statuses: List[int] = []
         last_text: str = ""
 
         for prefix in candidates:
             url = self.settings.upstream_url(prefix, "models")
             try:
                 resp = await client.get(url, headers=session.to_headers())
+            except LOCAL_REQUEST_ERRORS as exc:
+                raise UpstreamRequestInvalid(str(exc)) from exc
             except httpx.RequestError as exc:
                 raise UpstreamUnavailable(lang.t("unavailable_connect", url=url, exc=exc)) from exc
+
+            # U-3: a redirect is a configuration error, not a candidate to keep probing
+            await _reject_redirect(resp, url)
 
             status = resp.status_code
             if status in AUTH_FAILURE_CODES or (
@@ -178,7 +364,8 @@ class UpstreamClient:
                 await resp.aclose()
                 return prefix, status
 
-            last_status, last_text = status, resp.text[:200]
+            candidate_statuses.append(status)
+            last_text = resp.text[:200]
             if status == 404:
                 logger.debug(lang.t("probe_404", url=url))
             elif 200 <= status < 300:
@@ -193,16 +380,22 @@ class UpstreamClient:
             await resp.aclose()
 
         # No candidate could be confirmed: fall back to the first candidate so the upper
-        # layer gets a real error
+        # layer gets a real error. The reported status is the most informative one seen
+        # (auth failure > 5xx > anything else), not merely the last candidate's -- a
+        # 5xx on the first candidate followed by a 404 on the second must not be
+        # misreported as "the models route does not exist".
         #
-        # 没有候选能被确认：兜底用第一个候选，让上层拿到真实错误
+        # 没有候选能被确认：兜底用第一个候选，让上层拿到真实错误。上报的状态是
+        # 见过的"最有信息量"的那个（认证失败 > 5xx > 其它），而不是最后一个候选的——
+        # 首候选 5xx、次候选 404 的组合不得被误报成"模型路由不存在"。
         self.prefix = candidates[0]
+        reported_status = _most_informative_status(candidate_statuses)
         logger.warning(
-            lang.t("all_404", status=last_status, prefix=self.prefix),
+            lang.t("all_404", status=reported_status, prefix=self.prefix),
         )
         if last_text:
             logger.debug(lang.t("resp_fragment", text=last_text))
-        return self.prefix, last_status if last_status is not None else 404
+        return self.prefix, reported_status
 
     # ------------------------------------------------------------------ #
     # Requests
@@ -213,9 +406,14 @@ class UpstreamClient:
         url = self.settings.upstream_url(prefix, "models")
         client = await self.client()
         try:
-            return await client.get(url, headers=session.to_headers())
+            resp = await client.get(url, headers=session.to_headers())
+        except LOCAL_REQUEST_ERRORS as exc:
+            raise UpstreamRequestInvalid(str(exc)) from exc
         except httpx.RequestError as exc:
             raise UpstreamUnavailable(lang.t("unavailable_connect", url=url, exc=exc)) from exc
+        # U-3: never follow a redirect with the captured credentials attached
+        await _reject_redirect(resp, url)
+        return resp
 
     async def get_instance_config(self, session: Session) -> Optional[Dict[str, Any]]:
         """
@@ -241,6 +439,14 @@ class UpstreamClient:
                 url, headers=session.to_headers(), timeout=INSTANCE_META_TIMEOUT
             )
         except httpx.RequestError as exc:
+            logger.debug(lang.t("instance_meta_failed", exc=exc))
+            return None
+        except LOCAL_REQUEST_ERRORS as exc:
+            # An unusable header value: the metadata is a bonus, so it is skipped here;
+            # the paths that cannot do without the credentials raise their own error.
+            #
+            # 头值不可用：元信息是附加项，这里跳过即可；真正离不开凭证的路径
+            # 会自己抛错。
             logger.debug(lang.t("instance_meta_failed", exc=exc))
             return None
         try:
@@ -293,6 +499,13 @@ class UpstreamClient:
             url = self.settings.upstream_url(candidate, subpath)
             try:
                 resp = await client.send(build_request(client, url), stream=stream)
+            except LOCAL_REQUEST_ERRORS as exc:
+                # Building the request itself failed: another prefix would fail the same
+                # way, so this is reported as a bad request rather than retried (B12).
+                #
+                # 构造请求本身就失败了：换前缀会以同样方式失败，因此这被报成请求有误，
+                # 而不是重试（B12）。
+                raise UpstreamRequestInvalid(str(exc)) from exc
             except httpx.RequestError as exc:
                 last_exc = exc
                 if index == len(candidates) - 1:
@@ -300,10 +513,28 @@ class UpstreamClient:
                 logger.warning(lang.t("request_failed", url=url, exc=exc))
                 continue
 
+            # U-3: a 3xx is refused outright -- neither followed (the request carries the
+            # captured credentials) nor treated as a 404 to fall back from (a redirect is
+            # not "this prefix does not have the route").
+            #
+            # U-3：3xx 直接拒绝——既不跟随（请求带着抓到的凭证），也不当作 404 去回退
+            # （重定向并不意味着"该前缀没有这个路由"）。
+            await _reject_redirect(resp, url)
+
             if resp.status_code == 404 and index < len(candidates) - 1:
                 logger.debug(lang.t("fallback_404", url=url, next=candidates[index + 1]))
                 await resp.aclose()
                 continue
+            if resp.status_code != 404:
+                # Only a real answer counts as evidence about which prefix serves the
+                # API: when the fallback 404s as well (a path no candidate knows), both
+                # are equally wrong and flipping the cache would just add a hop to
+                # every later request.
+                #
+                # 只有真正的回答才算"哪个前缀在提供 API"的证据：回退候选同样 404 时
+                # （没有任何候选认识这个路径），两者一样错，翻转缓存只会给之后每个请求
+                # 都多加一跳。
+                self._note_prefix_served(candidate, index)
             return resp
 
         raise UpstreamUnavailable(lang.t("unavailable_base", base=self.settings.open_webui_base_url, exc=last_exc))
@@ -315,20 +546,31 @@ class UpstreamClient:
         payload: Dict[str, Any],
         *,
         stream: bool = False,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> httpx.Response:
         """
         POST JSON to the upstream; if the primary prefix returns 404 (no such
         route), fall back to the other candidate prefixes.
 
+        The body is serialized once and reused by every fallback attempt (R8):
+        passing `json=payload` would re-serialize the same dictionary once per
+        candidate. `extra_headers` is merged on top of the credential headers, which
+        is how probe traffic identifies itself (D11).
+
         POST JSON 到上游；若主前缀返回 404（无此路由）则回退到其它候选前缀。
+
+        请求体只序列化一次，供每次回退复用（R8）：传 `json=payload` 会按候选数把同一个
+        字典重复序列化。`extra_headers` 叠加在凭证头之上，探测流量正是靠它自报身份（D11）。
         """
+        body = json.dumps(payload).encode("utf-8")
 
         def build_request(client: httpx.AsyncClient, url: str) -> httpx.Request:
             # httpx's post() has no stream parameter; must use build_request + send
             # httpx 的 post() 不支持 stream 参数，必须用 build_request + send
-            return client.build_request(
-                "POST", url, headers=session.to_headers(), json=payload
-            )
+            headers = session.to_headers()
+            if extra_headers:
+                headers.update(extra_headers)
+            return client.build_request("POST", url, headers=headers, content=body)
 
         return await self._send_with_prefix_fallback(session, subpath, build_request, stream=stream)
 
@@ -364,25 +606,37 @@ class UpstreamClient:
     # 工具
     # ------------------------------------------------------------------ #
     @staticmethod
-    def forward_headers(resp: httpx.Response, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def forward_headers(resp: httpx.Response, extra: Optional[Dict[str, str]] = None) -> List[Tuple[str, str]]:
         """
-        Assemble the response headers to pass through to the client.
+        Assemble the response headers to pass through to the client, as a pair list.
 
         Keys are lowercased so that a same-named header from extra with different
         casing is not sent twice (HTTP headers are case-insensitive; duplicates get
-        joined by the client into "no, no").
+        joined by the client into "no, no"). Repeated upstream headers that survive
+        the drop list are preserved -- building a plain dict would silently keep only
+        the last one.
 
-        整理要透传给客户端的响应头。
+        The upstream's credential headers (Set-Cookie, WWW-Authenticate) are dropped
+        (U-4): the client authenticates with the proxy key, and a forwarded Set-Cookie
+        would hand it a usable upstream session that bypasses this proxy entirely.
+
+        整理要透传给客户端的响应头，返回键值对列表。
 
         键名统一小写，避免与 extra 里大小写不同的同名头被各发一次
         （HTTP 头不区分大小写，重复下发会被客户端拼成 "no, no"）。
+        能通过剔除表的重复头予以保留：直接构建 dict 会静默丢掉除最后一个之外的同名头。
+
+        上游的凭证类响应头（Set-Cookie、WWW-Authenticate）一律剔除（U-4）：客户端用
+        代理 Key 鉴权，放过去一个 Set-Cookie 就等于给它一份可绕过本代理的上游会话。
         """
-        drop = HOP_BY_HOP_HEADERS | SELF_GENERATED_HEADERS
-        headers = {
-            name.lower(): value
-            for name, value in resp.headers.items()
+        drop = HOP_BY_HOP_HEADERS | SELF_GENERATED_HEADERS | CREDENTIAL_RESPONSE_HEADERS
+        pairs: List[Tuple[str, str]] = [
+            (name.lower(), value)
+            for name, value in resp.headers.multi_items()
             if name.lower() not in drop
-        }
-        for key, value in (extra or {}).items():
-            headers[key.lower()] = value
-        return headers
+        ]
+        if extra:
+            extra_pairs = [(key.lower(), value) for key, value in extra.items()]
+            extra_keys = {key for key, _ in extra_pairs}
+            pairs = [pair for pair in pairs if pair[0] not in extra_keys] + extra_pairs
+        return pairs

@@ -9,6 +9,7 @@ drift apart on those two definitions.
 `app.py` re-exports these names, so routes and tests keep addressing them through the
 app module.
 
+
 模型列表规范化：把上游模型对象收敛为 OpenAI 模型对象。
 
 这里的一切都是纯函数：不发 HTTP、不碰缓存、不读配置。这里是唯一决定"哪些上游条目
@@ -32,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # models, and the token is far too generic to claim one. Requiring at least one
 # underscore segment after it (Q4_K_M, Q5_0) keeps the real llama.cpp-style names and
 # drops the standalone form (R4).
+#
 #
 # 模型名中可识别的量化标识：NVFP4、FP8、FP16、INT8、GPTQ、AWQ 等
 #
@@ -114,6 +116,7 @@ def _shared_default_capabilities(raw_models: List[Any]) -> Optional[Dict[str, bo
     template was also handed to DeepSeek-V4-Flash, which then answered an image with
     "is not a multimodal model".
 
+
     上游每个上报能力的模型都一致同意的那些键——这部分共同值就是 Open WebUI 合并进
     每个模型的"默认模型元数据"模板。
 
@@ -146,6 +149,7 @@ def _model_fingerprint(raw: Any, model_id: str) -> str:
     Deliberately excludes the top-level `created`: vLLM rebuilds its model card for
     every response and stamps it with the current time, so it changes on every fetch
     (verified: 1789036467 then 1789036470 three seconds later).
+
 
     仅从模型列表推导出的"服务该模型的引擎"廉价标识，检查它不需要任何请求。
 
@@ -183,6 +187,7 @@ def normalize_model(
     built here: they are established by probing the engine and attached by the
     caller, because the upstream's own capability dictionary is a deployment-wide
     default template rather than a fact about the model.
+
 
     把上游的模型对象收敛成 OpenAI 的 model 结构。
 

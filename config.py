@@ -3,6 +3,7 @@ Configuration module: read all settings from environment variables / a .env file
 
 All tunables live here to avoid os.getenv calls scattered across business code.
 
+
 配置模块：统一从环境变量 / .env 文件读取设置。
 
 所有可调项都集中在这里，避免在业务代码里散落 os.getenv。
@@ -14,10 +15,11 @@ import ipaddress
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -60,6 +62,7 @@ VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "TRACE")
 # "*" as the whole value restores the historical forward-everything behavior and is
 # the only way to get it -- an explicit, reviewable decision.
 #
+#
 # /v1/* 兜底透传默认转发的子路径（U-1）。默认最小权限：此处每列一条，就等于把
 # "运维账号在该上游路由上能做的一切"授予每一位代理 Key 持有者。
 #
@@ -67,6 +70,66 @@ VALID_LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "TRACE")
 # 可审计地做出该决定。
 DEFAULT_PASSTHROUGH_ALLOW = ("images", "audio", "files", "responses")
 PASSTHROUGH_ALLOW_WILDCARD = "*"
+
+# Control characters never belong in a forwarded path; the ASGI server already decoded
+# percent-escapes, so anything left in this class was smuggled deliberately.
+#
+# 控制字符绝无可能属于一条要转发的路径；ASGI 服务器已完成百分号解码，因此这里若还
+# 出现这类字符，只能是刻意夹带。
+_UNSAFE_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _has_parent_segment(path: str) -> bool:
+    """Whether any path segment is "..". / 路径中是否存在 ".." 段。"""
+    return any(segment == ".." for segment in path.strip("/").split("/"))
+
+
+def normalize_passthrough_path(path: str) -> Optional[str]:
+    """
+    Normalize an incoming /v1/* path for the allowlist check and for forwarding, or
+    return None when it must not be forwarded at all (H1).
+
+    The bypass this exists to close: `images/../../api/config` passed a `startswith`
+    check and was then *resolved* by the HTTP client (dot-segment removal, RFC 3986)
+    into `/api/config` -- so any holder of a proxy key could reach every upstream route
+    the allowlist exists to withhold. The check and the forwarded value are therefore
+    the same string, computed here, and it never contains a parent segment.
+
+    The path arrives already percent-decoded from the ASGI server, so "..%2f" is
+    already "../" by this point; it is decoded further anyway, because the upstream
+    decodes again, and any form whose deeper decoding still carries ".." is refused.
+    Empty and "." segments are dropped (the HTTP client would remove them anyway), and
+    backslashes and control characters are refused outright.
+
+
+    归一化进入的 /v1/* 路径（既用于白名单判断也用于转发）；完全不应转发时返回 None（H1）。
+
+    要关掉的绕过：`images/../../api/config` 能通过 `startswith` 检查，随后被 HTTP 客户端
+    按 RFC 3986 移除点段、*解析*成 `/api/config`——于是任何持有代理 Key 的人都能抵达白名单
+    本要挡住的全部上游路由。因此这里把"检查的值"与"转发的值"统一成同一个字符串，且它
+    永远不含父段。
+
+    路径从 ASGI 服务器出来时已做过百分号解码，此刻 "..%2f" 已是 "../"；这里仍然继续解码，
+    因为上游还会再解一次；任何"更深一层解码后仍含 .."的形式一律拒绝。空段与 "." 段被丢弃
+    （HTTP 客户端本来也会移除），反斜杠与控制字符直接拒绝。
+    """
+    raw = str(path)
+    if "\\" in raw or _UNSAFE_PATH_CHARS.search(raw) or _has_parent_segment(raw):
+        return None
+    decoded = raw
+    for _ in range(3):
+        unquoted = unquote(decoded)
+        if unquoted == decoded:
+            break
+        decoded = unquoted
+        if _has_parent_segment(decoded):
+            return None
+    segments = [
+        segment
+        for segment in raw.strip("/").split("/")
+        if segment not in ("", ".")
+    ]
+    return "/".join(segments)
 
 
 def _strip_host_brackets(host: str) -> str:
@@ -110,6 +173,7 @@ def _validate_base_url(base_url: str) -> None:
     would break the most typical setups to buy nothing; a LAN link being in cleartext
     is reported once at startup instead (see Settings.upstream_is_plain_http_nonloopback).
 
+
     校验 OPEN_WEBUI_BASE_URL 并原样返回：它必须能解析为带主机的 http(s) 地址，
     且端口可解析。
 
@@ -137,6 +201,7 @@ def _get_named_keys(env_var: str) -> Dict[str, str]:
     the first one, so a key containing colons must be written with an explicit name.
     Later duplicates of a name win, with a warning: silently keeping the first would
     make a rotation that edits only the key half appear to work.
+
 
     解析 PROXY_API_KEYS：逗号分隔的 "name:key" 条目，使每个客户端可被单独识别、
     轮换与撤销（U-10）。
@@ -315,6 +380,14 @@ class Settings:
     # 安全联锁（D13）：PROXY_API_KEY 为空且 PROXY_HOST 非回环地址时拒绝启动，
     # 除非显式设置本项。
     allow_insecure: bool = False
+    # Brute-force interlock (L3): once one client address has produced this many failed
+    # proxy-key attempts inside the window, further attempts are answered 429 (with
+    # Retry-After) until the oldest failure ages out. 0 disables the limiter.
+    #
+    # 爆破联锁（L3）：同一客户端地址在窗口内失败的代理 Key 尝试达到该次数后，后续尝试
+    # 一律 429（带 Retry-After），直到最早的失败滑出窗口。0 表示关闭限速。
+    auth_failure_limit: int = 10
+    auth_failure_window: float = 60.0
     # Subpaths the /v1/* catch-all passthrough may forward (U-1). Defaults to
     # DEFAULT_PASSTHROUGH_ALLOW; empty means "nothing" (deny all), and
     # passthrough_allow_all restores the historical forward-everything behavior for
@@ -365,6 +438,7 @@ class Settings:
         default) stays silent -- it is not on the network at all, and warning about it
         would only train the operator to ignore the warning.
 
+
         上游是否通过非回环主机上的明文 http 访问（U-8）：此刻凭证与对话内容会明文过网。
 
         刻意只是**提示**，不是拒绝。局域网里的 Open WebUI（"http://192.168.x.x:3000"）
@@ -382,16 +456,31 @@ class Settings:
 
     def passthrough_permits(self, path: str) -> bool:
         """
-        Whether the /v1/* catch-all may forward `path` (U-1): exact match or subpath
-        of an allowlisted entry ("responses" permits /v1/responses and
+        Whether the /v1/* catch-all may forward `path` (U-1, H1): exact match or
+        subpath of an allowlisted entry ("responses" permits /v1/responses and
         /v1/responses/...). An empty allowlist denies everything.
 
-        兜底透传是否允许转发 `path`（U-1）：与白名单条目精确相等，或为其子路径
+        The path is normalized first (normalize_passthrough_path). A path that cannot
+        be forwarded as written -- one carrying a parent segment, a backslash or a
+        control character -- is denied in every mode, PASSTHROUGH_ALLOW=* included:
+        "forward everything" does not mean "forward something other than what was
+        asked for", which is exactly what the HTTP client's dot-segment removal would
+        otherwise do with it.
+
+
+        兜底透传是否允许转发 `path`（U-1、H1）：与白名单条目精确相等，或为其子路径
         （"responses" 放行 /v1/responses 与 /v1/responses/...）。白名单为空即全拒。
+
+        判定前先归一化（normalize_passthrough_path）。无法"按原样转发"的路径——含父段、
+        反斜杠或控制字符——在任何模式下都拒绝，`PASSTHROUGH_ALLOW=*` 也不例外：
+        "全量转发"并不意味着"转发一个与请求不符的东西"，而 HTTP 客户端的点段移除恰好
+        会把前者变成后者。
         """
+        normalized = normalize_passthrough_path(path)
+        if normalized is None:
+            return False
         if self.passthrough_allow_all:
             return True
-        normalized = path.strip("/")
         return any(
             normalized == allowed or normalized.startswith(allowed + "/")
             for allowed in self.passthrough_allow
@@ -421,6 +510,7 @@ class Settings:
         callers validate it and answer 400, instead of this lookup raising TypeError
         and turning a client mistake into an HTTP 500.
 
+
         用 MODEL_ALIASES 映射客户端请求的模型名。
 
         畸形请求体可能携带非字符串的 `model`（dict/list）：它没有别名语义，也不可哈希，
@@ -433,6 +523,21 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    """
+    Read the configuration from the environment (and .env) into a frozen Settings.
+
+    This is the STARTUP DEFAULT, not necessarily the runtime instance: `app.main` rebuilds
+    it for --host/--port/--lang and adopts the result via `probe_runner.use_settings`
+    (I9). The module-level `settings` below therefore must not be treated as "the current
+    settings" by new code -- reach for the app module (or probe_runner) instead.
+
+
+    从环境变量（及 .env）读取配置，构造 frozen 的 Settings。
+
+    这是**启动默认值**，未必是运行时实例：`app.main` 会为 --host/--port/--lang 重建它，
+    并通过 `probe_runner.use_settings` 采纳结果（I9）。因此下方模块级的 `settings` 不应被
+    新代码当作"当前设置"——请改从 app 模块（或 probe_runner）获取。
+    """
     base_url = os.getenv("OPEN_WEBUI_BASE_URL", "http://localhost:8080").strip().rstrip("/")
     if not base_url:
         raise RuntimeError(lang.t("base_url_empty"))
@@ -465,9 +570,20 @@ def load_settings() -> Settings:
     else:
         entries = [item.strip() for item in raw_passthrough.split(",") if item.strip()]
         passthrough_allow_all = PASSTHROUGH_ALLOW_WILDCARD in entries
-        passthrough_allow = [
-            item for item in entries if item != PASSTHROUGH_ALLOW_WILDCARD
-        ]
+        # Entries go through the same normalization as the request path, so a configured
+        # "/responses/" means the same thing as "responses" -- and an entry that cannot
+        # name a forwardable path at all ("..", "a/../b") is dropped instead of silently
+        # never matching.
+        #
+        # 条目与请求路径走同一个归一化，因此配置成 "/responses/" 与 "responses" 含义相同；
+        # 而根本无法指代可转发路径的条目（".."、"a/../b"）会被丢弃，而不是静默永不匹配。
+        passthrough_allow = []
+        for item in entries:
+            if item == PASSTHROUGH_ALLOW_WILDCARD:
+                continue
+            normalized = normalize_passthrough_path(item)
+            if normalized and normalized not in passthrough_allow:
+                passthrough_allow.append(normalized)
 
     return Settings(
         open_webui_base_url=base_url,
@@ -524,6 +640,10 @@ def load_settings() -> Settings:
         expose_upstream_error=_get_bool("EXPOSE_UPSTREAM_ERROR", False),
         max_body_bytes=_get_int("MAX_BODY_BYTES", 10 * 1024 * 1024, minimum=1),
         allow_insecure=_get_bool("ALLOW_INSECURE", False),
+        # 0 disables the brute-force interlock (the window is then never consulted).
+        # 0 表示关闭爆破联锁（此时窗口值不再被使用）。
+        auth_failure_limit=_get_int("AUTH_FAILURE_LIMIT", 10, minimum=0),
+        auth_failure_window=_get_float("AUTH_FAILURE_WINDOW", 60.0, minimum=1.0),
         passthrough_allow=passthrough_allow,
         passthrough_allow_all=passthrough_allow_all,
         model_aliases=_get_aliases("MODEL_ALIASES"),

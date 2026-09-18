@@ -6,6 +6,7 @@ Entry points:
     python app.py --login      # Force re-login and refresh credentials
     python app.py --check      # Only verify whether the current credentials still work
 
+
 open-webui-to-openai-api -- 把 Open WebUI 反代为 OpenAI 兼容接口。
 
 入口：
@@ -21,9 +22,11 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from secrets import compare_digest
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import lang
 import httpx
@@ -34,7 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 try:
-    from config import Settings, settings
+    from config import Settings, normalize_passthrough_path, settings
 except RuntimeError as exc:
     # Invalid configuration (most commonly a missing http:// in OPEN_WEBUI_BASE_URL) is
     # raised as RuntimeError at import time. Intercept it here and turn it into a
@@ -71,6 +74,7 @@ from request_context import (
     bind_request_id,
     new_request_id,
     request_id_suffix,
+    sanitize_log_text,
 )
 # Model-list normalization (pure logic, no HTTP/cache/config) lives in models.py (R5);
 # the names are re-exported so routes and tests keep addressing them through app.
@@ -283,6 +287,7 @@ if settings.cors_origins:
 # probed prefix, the model list) is per-deployment information that must not sit in a
 # shared or browser cache.
 #
+#
 # 对所有响应统一施加的静态加固。它们都不需要逐路由判断：本代理不吐 HTML，而它吐出的
 # 一切（上游地址、探测到的前缀、模型列表）都是部署级信息，不应留在共享缓存或浏览器缓存里。
 _SECURITY_RESPONSE_HEADERS = (
@@ -318,6 +323,7 @@ class RequestContextMiddleware:
     bound for the request's context -- every log line the request produces carries it --
     and echoed back in the response header, so a client reporting "the upstream errored"
     can be answered by grepping one id.
+
 
     为每个请求附上关联 id，并加固每个响应（U-7、U-9）。
 
@@ -394,6 +400,7 @@ def match_proxy_key(presented: str) -> Optional[str]:
     constant time, as before. Must encode to bytes -- compare_digest raises TypeError
     on non-ASCII str, which would turn a Chinese key's 401 into a 500.
 
+
     请求出示的是哪一把已配置的代理 Key（按名字）；一把都不匹配时返回 None（U-10）。
 
     每一把已配置的 Key 都会被比较，不提前返回：首个命中即返回会让响应耗时依赖命中
@@ -424,6 +431,7 @@ def is_proxy_key_valid(request: Request) -> bool:
     /healthz) stay accessible without auth, and only use this result to decide
     whether to expose sensitive fields such as the upstream address.
 
+
     请求是否携带有效代理 Key；未启用鉴权（PROXY_API_KEY 与 PROXY_API_KEYS 都为空）
     时恒为 True。
 
@@ -437,7 +445,83 @@ def is_proxy_key_valid(request: Request) -> bool:
 
 def require_proxy_key(request: Request) -> None:
     if not is_proxy_key_valid(request):
+        _record_auth_failure(request)
         raise _http_error(401, lang.t("err_invalid_api_key"), code="invalid_api_key")
+    _clear_auth_failures(request)
+
+
+# --------------------------------------------------------------------------- #
+# Brute-force interlock (L3)
+# 爆破联锁（L3）
+# --------------------------------------------------------------------------- #
+# Failed attempts per client address, oldest first. match_proxy_key already compares in
+# constant time and without an early exit, but without this a key was still guessable at
+# full request rate -- 30 wrong-key attempts were answered in 0.34s with no backoff,
+# no lockout and the correct key still working immediately afterwards.
+#
+# 逐客户端地址的失败尝试，最早在前。match_proxy_key 已经是定长比较且不提前返回，但仅凭
+# 它，Key 依然可以按请求全速率猜测——实测 30 次错误 Key 在 0.34 秒内被逐一应答，没有退避、
+# 没有锁定，随后正确 Key 立即可用。
+_auth_failures: Dict[str, List[float]] = {}
+
+# How many client addresses are remembered at most, so the limiter itself cannot be
+# turned into a memory sink by a spray from many source addresses.
+#
+# 最多记忆多少个客户端地址，避免攻击者用海量源地址把限速器本身变成内存池。
+_AUTH_FAILURE_MAX_CLIENTS = 4096
+
+
+def _client_address(request: Request) -> str:
+    """The peer address of the request; "unknown" when the server did not supply one.
+
+    请求的对端地址；服务器未提供时返回 "unknown"。
+    """
+    client = request.client
+    return client.host if client is not None and client.host else "unknown"
+
+
+def _record_auth_failure(request: Request) -> None:
+    """
+    Record one failed proxy-key attempt; once the limit is reached inside the window,
+    answer 429 with Retry-After instead of another 401.
+
+    记录一次失败的代理 Key 尝试；窗口内达到上限后，以带 Retry-After 的 429 代替 401。
+    """
+    limit = settings.auth_failure_limit
+    if limit <= 0:
+        return
+    now = time.monotonic()
+    window = settings.auth_failure_window
+    address = _client_address(request)
+    failures = [
+        moment for moment in _auth_failures.get(address, []) if now - moment < window
+    ]
+    if len(failures) >= limit:
+        retry_after = max(1, int(window - (now - failures[0])) + 1)
+        _auth_failures[address] = failures
+        raise _http_error(
+            429,
+            lang.t("err_too_many_attempts", retry=retry_after),
+            headers={"Retry-After": str(retry_after)},
+            code="too_many_requests",
+        )
+    failures.append(now)
+    _auth_failures[address] = failures
+    if len(_auth_failures) > _AUTH_FAILURE_MAX_CLIENTS:
+        for stale in [
+            key
+            for key, moments in _auth_failures.items()
+            if not moments or now - moments[-1] >= window
+        ]:
+            _auth_failures.pop(stale, None)
+
+
+def _clear_auth_failures(request: Request) -> None:
+    """A valid key clears the address's failure streak.
+
+    有效 Key 会清零该地址的失败计数。
+    """
+    _auth_failures.pop(_client_address(request), None)
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +542,7 @@ def openai_error(
 
     `headers` carries pass-through response headers -- currently Retry-After from an
     upstream 429, so clients can back off precisely instead of guessing.
+
 
     返回 OpenAI 风格的错误体，而不是 FastAPI 默认的 {"detail": ...}。
 
@@ -506,6 +591,7 @@ def _upstream_unavailable_error(exc: UpstreamUnavailable) -> HttpError:
     verbatim only when EXPOSE_UPSTREAM_ERROR is on, and otherwise a fixed message plus
     the request id (U-6).
 
+
     把"上游连不上/无法处理"翻译成对客户端的错误。
 
     本地细节（主机、端口、网络栈）进日志；只有在 EXPOSE_UPSTREAM_ERROR 打开时客户端
@@ -531,6 +617,7 @@ def _invalid_request_response(exc: UpstreamRequestInvalid) -> JSONResponse:
     it goes to the log; the client gets the detail only with EXPOSE_UPSTREAM_ERROR on,
     and a fixed sentence plus the request id otherwise (U-6).
 
+
     构造都构造不出来的请求（HTTP 栈拒绝的头值）属于请求有误，而不是上游故障（B12）：
     以 400 加原因作答，把诊断留在它该在的地方，而不是塞进 500 里藏起来。
 
@@ -550,10 +637,31 @@ def _invalid_request_response(exc: UpstreamRequestInvalid) -> JSONResponse:
     )
 
 
+def _latin1_safe(value: str) -> str:
+    """
+    Make a header value safe for Starlette to encode (M1).
+
+    httpx decodes upstream header bytes as UTF-8, while Starlette encodes response
+    headers as latin-1 -- so one upstream header holding anything outside latin-1 (a
+    raw UTF-8 filename in `Content-Disposition`, say) raised UnicodeEncodeError and
+    turned a streaming route into an HTTP 500 with a traceback. Unencodable characters
+    are replaced instead of crashing the response.
+
+    httpx 把上游响应头字节按 UTF-8 解码，而 Starlette 按 latin-1 编码响应头——因此只要
+    上游有一个头含 latin-1 之外的字符（例如 `Content-Disposition` 里直接写中文文件名），
+    就会抛 UnicodeEncodeError，把流式路由变成带 traceback 的 HTTP 500。这里改为替换
+    无法编码的字符，而不是让响应崩溃。
+    """
+    return str(value).encode("latin-1", "replace").decode("latin-1")
+
+
 def _passthrough_retry_headers(resp: httpx.Response) -> Optional[Dict[str, str]]:
-    """Retry-After from the upstream (429 and friends) survives the wrapping."""
+    """Retry-After from the upstream (429 and friends) survives the wrapping.
+
+    上游（429 之类）的 Retry-After 在包装之后仍然保留。
+    """
     retry_after = resp.headers.get("retry-after")
-    return {"Retry-After": retry_after} if retry_after else None
+    return {"Retry-After": _latin1_safe(retry_after)} if retry_after else None
 
 
 def _as_response_headers(pairs: List[Tuple[str, str]]) -> Any:
@@ -565,16 +673,29 @@ def _as_response_headers(pairs: List[Tuple[str, str]]) -> Any:
     credential headers (Set-Cookie, WWW-Authenticate) have already been dropped by
     forward_headers (U-4); what survives here is ordinary multi-valued headers.
 
+    Values are made latin-1-encodable first (M1): they come from the upstream, which
+    is free to send bytes this side cannot re-encode. Names are lowercased here as well
+    -- Starlette's `raw=` constructor keeps them verbatim, while its lookups lowercase,
+    so a mixed-case name would be sent but never found again.
+
+
     把 forward_headers 的键值对列表包装成 Starlette 的 Headers 对象。
 
     StreamingResponse 只接受 Mapping（会把重复头静默合并）或 Headers 实例——
     后者的内部列表保留每一次出现。凭证类响应头（Set-Cookie、WWW-Authenticate）
     已被 forward_headers 剔除（U-4）；这里留下的都是普通的多值头。
+
+    值先转为 latin-1 可编码（M1）：它们来自上游，而上游完全可能发出本侧无法重新编码的字节。
+    键名也在这里统一小写——Starlette 的 `raw=` 构造会原样保留，而它的查找会小写化，
+    因此一个大小写混杂的名字会被发出、却再也查不到。
     """
     from starlette.datastructures import Headers as StarletteHeaders
 
     return StarletteHeaders(
-        raw=[(name.encode("latin-1"), value.encode("latin-1")) for name, value in pairs]
+        raw=[
+            (str(name).lower().encode("latin-1", "replace"), _latin1_safe(value).encode("latin-1"))
+            for name, value in pairs
+        ]
     )
 
 
@@ -614,27 +735,31 @@ def _auth_failure_response(status_code: int) -> JSONResponse:
 @app.get("/", tags=["meta"])
 async def index(request: Request) -> Dict[str, Any]:
     """
-    Service metadata. Unauthenticated, but the upstream address is only returned
-    when the request passes key validation -- so nobody can use this endpoint to
-    map out the internal topology.
+    Service metadata. Unauthenticated, and deliberately minimal without a key (L4):
+    the response names the service and the version, and nothing else. Whether
+    credentials are ready, whether auth is on, the endpoint inventory and the upstream
+    address are all facts about this deployment that a caller who cannot authenticate
+    has no business collecting -- they are exactly the reconnaissance a follow-up
+    attempt wants.
 
-    服务元信息。免鉴权，但上游地址只在请求通过 Key 校验时返回——
-    避免任何人都能借这个端点摸清内网拓扑。
+    服务元信息。免鉴权，但**无 Key 时刻意只回最小信息**（L4）：只说明是哪个服务、哪个
+    版本在应答，别无其他。凭证是否就绪、是否启用鉴权、端点清单、上游地址，都属于"无法通过
+    鉴权的调用方没理由收集"的部署事实——而它们恰恰是后续攻击最想要的侦察材料。
     """
     response_body: Dict[str, Any] = {
         "service": "open-webui-to-openai-api",
         "version": VERSION,
-        "session_ready": session_exists(settings),
-        "endpoints": [
+    }
+    if is_proxy_key_valid(request):
+        response_body["session_ready"] = session_exists(settings)
+        response_body["endpoints"] = [
             "GET  /healthz",
             "GET  /v1/models",
             lang.t("endpoint_retrieve_model"),
             "POST /v1/chat/completions",
             "POST /v1/embeddings",
             lang.t("endpoint_passthrough"),
-        ],
-    }
-    if is_proxy_key_valid(request):
+        ]
         response_body["upstream"] = settings.open_webui_base_url
         response_body["upstream_prefix"] = upstream.prefix
     return response_body
@@ -644,28 +769,29 @@ async def index(request: Request) -> Dict[str, Any]:
 async def healthz(request: Request) -> Dict[str, Any]:
     """
     Health check. Stays unauthenticated and always 200 (probe/load-balancer
-    friendly); the upstream address is likewise only returned when the request
-    passes key validation.
+    friendly); without a key the body is just {"status": "ok"} (L4). Everything else
+    -- version, credential readiness, whether auth is on, the upstream address, the
+    probe health -- is returned only when the request passes key validation.
 
     With a valid key it also carries the probe health (U-11): whether the last probe
     rounds succeeded, whether the credentials are being rejected, and the last
     recorded failure. Without it, a dead session was only visible as "N probes failed"
     somewhere in the log.
 
-    健康检查。保持免鉴权 200（探针/负载均衡友好），上游地址同样只在
-    请求通过 Key 校验时返回。
+
+    健康检查。保持免鉴权且恒为 200（探针/负载均衡友好）；无 Key 时响应体只有
+    {"status": "ok"}（L4）。其余一切——版本、凭证是否就绪、是否启用鉴权、上游地址、
+    探测健康——只在请求通过 Key 校验时返回。
 
     带有效 Key 时还会附上探测健康状态（U-11）：最近几轮探测是否成功、凭证是否正被
     拒绝、以及最近一次失败记录。没有它时，死掉的会话只能从日志里某处的"N 个模型探测
     失败"间接推断。
     """
-    response_body: Dict[str, Any] = {
-        "status": "ok",
-        "version": VERSION,
-        "session_ready": session_exists(settings),
-        "auth_required": settings.authentication_enabled(),
-    }
+    response_body: Dict[str, Any] = {"status": "ok"}
     if is_proxy_key_valid(request):
+        response_body["version"] = VERSION
+        response_body["session_ready"] = session_exists(settings)
+        response_body["auth_required"] = settings.authentication_enabled()
         response_body["upstream"] = settings.open_webui_base_url
         response_body["upstream_prefix"] = upstream.prefix
         response_body["probe"] = probe_health.to_dict()
@@ -687,6 +813,7 @@ def _models_with_probe_fields(
 
     Also refreshes the instance-level default capability template, which comes free
     with the model list.
+
 
     规范化上游模型列表，并附上探测已确立的一切。
 
@@ -785,6 +912,7 @@ async def retrieve_model(model_id: str, _: None = Depends(require_proxy_key)) ->
     the upstream, where /api/v1/models/<id> is not a route and Open WebUI's SPA
     answers with HTTP 200 and an HTML page -- a 200 no OpenAI client can parse.
 
+
     OpenAI 的 "retrieve model"：返回单个规范化模型对象，找不到则 404。
 
     特意在本地实现。兜底透传以前会把它转发到上游，而 /api/v1/models/<id> 并不是
@@ -825,7 +953,13 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
     # `{"stream": []}` 过去都会把请求翻进流式分支，客户端于是等一个它从没要求的 SSE。
     # 只有真正的 JSON `true` 才走流式——那正是所有 OpenAI 客户端的发法。
     is_stream = payload.get("stream") is True
-    logger.debug(lang.t("forward_chat", model=payload.get("model"), stream=is_stream))
+    # The model name is client-supplied text: sanitized before it reaches a log line
+    # (L1), so it cannot forge one.
+    #
+    # 模型名是客户端提供的文本：进日志前先清洗（L1），使它无法伪造日志行。
+    logger.debug(
+        lang.t("forward_chat", model=sanitize_log_text(payload.get("model")), stream=is_stream)
+    )
 
     try:
         resp = await upstream.post(session, "chat/completions", payload, stream=is_stream)
@@ -885,7 +1019,7 @@ async def chat_completions(request: Request, _: None = Depends(require_proxy_key
                 code="upstream_error",
             )
 
-    media_type = resp.headers.get("content-type", "text/event-stream")
+    media_type = _latin1_safe(resp.headers.get("content-type", "text/event-stream"))
     # Only the headers this proxy really owns are added. Connection and friends are
     # hop-by-hop and stay the protocol layer's business (uvicorn decides on reuse);
     # stripping them from the upstream response only to re-add one here would be
@@ -985,7 +1119,13 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
     """Catch-all passthrough: forward unimplemented /v1/* requests to the
     corresponding upstream path as-is.
 
+    The path is normalized first and the allowlist is checked against that normalized
+    string, so the value that is authorized and the value that is forwarded are the
+    same one (H1).
+
     兜底透传：把未单独实现的 /v1/* 请求原样转发到上游对应路径。
+
+    路径先归一化，白名单校验的正是归一化后的字符串——被授权的值与被转发的值是同一个（H1）。
     """
     if not path.strip("/"):
         return openai_error(lang.t("err_passthrough_path"), 404, code="not_found")
@@ -996,14 +1136,42 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
     # PASSTHROUGH_ALLOW=* is the explicit opt-in to the historical forward-everything
     # behavior.
     #
+    # H1: a path that cannot be forwarded as written (one with a parent segment, a
+    # backslash or a control character) is refused -- it used to pass the allowlist and
+    # then be resolved by the HTTP client into a completely different upstream route.
+    #
     # U-1：兜底透传会带着运维抓到的凭证转发，因此现在受白名单约束。默认覆盖
     # OpenAI 风格的附加路由（images/audio/files/responses）；PASSTHROUGH_ALLOW 可增可减，
     # PASSTHROUGH_ALLOW=* 是对历史上"全量透传"行为的显式选择。
-    if not settings.passthrough_permits(path):
-        logger.warning(lang.t("passthrough_forbidden_log", path=path))
+    #
+    # H1：无法"按原样转发"的路径（含父段、反斜杠或控制字符）一律拒绝——它过去能通过白名单，
+    # 随后被 HTTP 客户端解析成一个完全不同的上游路由。
+    normalized_path = normalize_passthrough_path(path)
+    if normalized_path is None or not settings.passthrough_permits(normalized_path):
+        # The refused path is client-controlled: sanitized before it reaches a log
+        # line (L1).
+        #
+        # 被拒绝的路径由客户端控制：进日志前先清洗（L1）。
+        logger.warning(lang.t("passthrough_forbidden_log", path=sanitize_log_text(path)))
         return openai_error(
             lang.t("passthrough_forbidden"), 403, code="passthrough_forbidden"
         )
+
+    # Defence in depth (H1): check what the request will *resolve to*, not only what was
+    # asked for. Nothing below can introduce a parent segment any more, but this keeps
+    # the guarantee true if the path handling above is ever changed.
+    #
+    # 纵深防御（H1）：核对请求"实际会解析成什么"，而不只是"请求了什么"。下面已不可能引入
+    # 父段，但这样该保证在日后改动上面的路径处理时依然成立。
+    if not all(
+        _target_stays_within_allowlist(candidate, normalized_path)
+        for candidate in settings.prefix_candidates()
+    ):
+        logger.warning(lang.t("passthrough_forbidden_log", path=sanitize_log_text(path)))
+        return openai_error(
+            lang.t("passthrough_forbidden"), 403, code="passthrough_forbidden"
+        )
+    path = normalized_path
 
     session = _session_or_error()
     headers = session.to_headers()
@@ -1012,8 +1180,25 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
     content_type = request.headers.get("content-type", "")
     if content_type:
         headers["Content-Type"] = content_type
-    request_body = await request.body()
-    subpath = f"{path}?{request.url.query}" if request.url.query else path
+    # The same hard cap the JSON routes use (M2): this route used to read the body in
+    # full, so the documented size limit did not hold for the one route that forwards
+    # file-sized payloads.
+    #
+    # 与 JSON 路由同一个硬上限（M2）：本路由过去把请求体整份读进内存，于是那个写明的上限
+    # 恰恰在"唯一会转发文件级负载的路由"上不成立。
+    request_body = await _read_body_capped(request)
+    # Rebuild the target from the raw query bytes instead of the parsed URL (L2): a
+    # literal "#" made the parsed query end there, so everything after it was dropped
+    # before forwarding. Characters that would change meaning once re-embedded are
+    # percent-encoded; already-encoded sequences are preserved.
+    #
+    # 用原始 query 字节重建目标，而不是用已解析的 URL（L2）：字面 "#" 会让解析结果认为查询串
+    # 到此为止，其后的内容在转发前被丢弃。重新嵌入会改变含义的字符一律百分号编码；已是编码
+    # 形式的部分原样保留。
+    query = quote(
+        request.scope.get("query_string", b"").decode("latin-1"), safe=_QUERY_SAFE
+    )
+    subpath = f"{path}?{query}" if query else path
 
     # Consistent with chat/embeddings: fall back to the other candidate prefixes
     # when the primary prefix returns 404 (route not found)
@@ -1032,7 +1217,7 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
         await resp.aclose()
         return _auth_failure_response(resp.status_code)
 
-    media_type = resp.headers.get("content-type", "application/json")
+    media_type = _latin1_safe(resp.headers.get("content-type", "application/json"))
     stream_headers = _as_response_headers(
         UpstreamClient.forward_headers(resp, {"X-Accel-Buffering": "no"})
     )
@@ -1048,9 +1233,41 @@ async def v1_passthrough(path: str, request: Request, _: None = Depends(require_
 # Helpers
 # 辅助
 # --------------------------------------------------------------------------- #
-async def _read_json_body(request: Request) -> Dict[str, Any]:
+# Characters that survive verbatim when a target is rebuilt from the raw query bytes:
+# RFC 3986's query set minus "#" (which would start a fragment), plus "%" so an
+# already-encoded sequence is not encoded a second time (L2).
+#
+# 用原始 query 字节重建目标时可原样保留的字符：RFC 3986 的 query 集合去掉 "#"（它会开启
+# 片段），再加上 "%"，使已编码的序列不会被二次编码（L2）。
+_QUERY_SAFE = "!$&'()*+,-./:;=?@_~%"
+
+
+def _target_stays_within_allowlist(prefix: str, subpath: str) -> bool:
     """
-    Read and parse the JSON request body under a hard size cap (U-2).
+    Whether `prefix` + `subpath` still resolves inside an allowlisted upstream subpath
+    once the HTTP client has normalized it (H1, defence in depth).
+
+    `prefix` + `subpath` 经 HTTP 客户端归一化之后，是否仍落在白名单覆盖的上游子路径内
+    （H1，纵深防御）。
+    """
+    try:
+        resolved = httpx.URL(settings.upstream_url(prefix, subpath))
+    except (httpx.InvalidURL, ValueError):
+        return False
+    prefix_segments = [segment for segment in prefix.strip("/").split("/") if segment]
+    resolved_segments = [
+        segment for segment in resolved.path.strip("/").split("/") if segment
+    ]
+    if resolved_segments[: len(prefix_segments)] != prefix_segments:
+        return False
+    return settings.passthrough_permits(
+        "/".join(resolved_segments[len(prefix_segments) :])
+    )
+
+
+async def _read_body_capped(request: Request) -> bytes:
+    """
+    Read the whole request body under a hard size cap (U-2).
 
     The previous version only looked at a numeric Content-Length, so a chunked request
     -- which declares no length at all -- was read into memory in full before the cap
@@ -1058,11 +1275,17 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
     on every chunk, so the cap holds for every request shape; the declared length is
     still checked first because it rejects an oversized body without reading it.
 
-    在硬性大小上限之下读取并解析 JSON 请求体（U-2）。
+    Shared by the JSON routes and the catch-all passthrough, which used to read the
+    body with `request.body()` and therefore sat entirely outside the cap (M2).
+
+
+    在硬性大小上限之下读取整个请求体（U-2）。
 
     旧实现只看纯数字的 Content-Length，因此不带长度声明的 chunked 请求会被完整读进
     内存之后上限才可能生效。现在改为流式消费请求体，并在每个分块上核对累计字节数，
     使上限对任何请求形态都成立；声明长度仍先检查——它能在不读取的前提下直接拒收超大请求体。
+
+    由 JSON 路由与兜底透传共用；后者过去用 `request.body()` 读体，因而完全落在上限之外（M2）。
     """
     declared_length = request.headers.get("content-length", "")
     if declared_length.isdigit() and int(declared_length) > settings.max_body_bytes:
@@ -1101,8 +1324,18 @@ async def _read_json_body(request: Request) -> Dict[str, Any]:
             400, lang.t("err_client_disconnected"), code="client_disconnected"
         ) from exc
 
+    return b"".join(chunks)
+
+
+async def _read_json_body(request: Request) -> Dict[str, Any]:
+    """
+    Read and parse the JSON request body, under the same hard size cap (U-2).
+
+    在同一个硬性大小上限之下读取并解析 JSON 请求体（U-2）。
+    """
+    raw = await _read_body_capped(request)
     try:
-        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise _http_error(400, lang.t("err_invalid_json"), code="invalid_json")
     if not isinstance(payload, dict):
@@ -1146,6 +1379,7 @@ async def _sse_iterator(resp: httpx.Response, request: Request):
     ReadError), not StreamError, so both must be caught: otherwise the exception
     reaches the ASGI layer, the client loses even the content it already received,
     and the server leaves a pile of tracebacks behind.
+
 
     转发上游字节流；客户端断开时主动关闭上游连接，避免悬挂。
 
@@ -1221,25 +1455,64 @@ async def _run_probe_cli() -> int:
         await upstream.aclose()
 
 
+_LANG_FLAGS = ("-l", "--lang", "--language")
+
+
 def _preconfigure_language(cli_args: List[str]) -> None:
     """
-    Honor --lang for argparse's own output (--help): argparse exits during parsing,
-    before the post-parse reconfigure in main(), so argv is scanned up front. Both
-    the space form (--lang zh) and the equals form (--lang=zh) are recognized.
+    Honor -l / --lang / --language for argparse's own output (--help): argparse exits
+    during parsing, before the post-parse reconfigure in main(), so argv is scanned up
+    front. The space form (--lang zh) and the equals form (--lang=zh) are recognized.
 
-    让 --lang 也能作用于 argparse 自身的输出（--help）：argparse 在解析阶段就会退出，
-    早于 main() 里解析后的重配置，因此先扫一遍 argv。空格形式（--lang zh）与
-    等号形式（--lang=zh）都能识别。
+    让 -l / --lang / --language 也能作用于 argparse 自身的输出（--help）：argparse 在
+    解析阶段就会退出，早于 main() 里解析后的重配置，因此先扫一遍 argv。空格形式
+    （--lang zh）与等号形式（--lang=zh）都能识别。
     """
     for index, token in enumerate(cli_args):
         name, separator, value = token.partition("=")
-        if name != "--lang":
+        if name not in _LANG_FLAGS:
             continue
         if separator:
             lang.configure(lang.resolve_language(value))
         elif index + 1 < len(cli_args):
             lang.configure(lang.resolve_language(cli_args[index + 1]))
         break
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    """
+    Apply --host / --port / --lang by rebuilding the frozen settings and adopting them in
+    both runtime holders (I9).
+
+    `config.settings` deliberately stays the import-time value: it is the startup default,
+    while the live instance belongs to this module and to probe_runner. Adoption goes
+    through `probe_runner.use_settings`, which swaps its own singletons as well, so the
+    two can no longer be updated separately -- that separation was the fragile part.
+
+    Nothing is rebuilt when no override was given, so the no-flag path keeps sharing the
+    imported instance.
+
+    --host / --port / --lang 通过重建 frozen settings 生效，并在两个运行时持有者中一并采纳（I9）。
+
+    `config.settings` 刻意保持 import 期的值：它是启动默认值，而运行时实例属于本模块与
+    probe_runner。采纳动作走 `probe_runner.use_settings`，由它同时替换自己那套单例，因此
+    两者不再可能被分别更新——而"分别更新"正是原来脆弱的地方。
+
+    没有提供任何覆盖项时不重建，未带参数的路径继续共用 import 进来的实例。
+    """
+    global settings, upstream
+    if args.host is None and args.port is None and args.lang == lang.LANG_AUTO:
+        return
+
+    import dataclasses
+
+    settings = dataclasses.replace(
+        settings,
+        proxy_host=args.host if args.host is not None else settings.proxy_host,
+        proxy_port=args.port if args.port is not None else settings.proxy_port,
+        language=lang.resolve_language(args.lang),
+    )
+    upstream = probe_runner.use_settings(settings)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1258,8 +1531,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--host", default=None, help=lang.t("cli_host_help"))
     parser.add_argument("--port", type=int, default=None, help=lang.t("cli_port_help"))
     parser.add_argument(
+        "-l",
         "--lang",
-        choices=(lang.LANG_ZH, lang.LANG_EN, lang.LANG_AUTO),
+        "--language",
+        choices=lang.LANG_CHOICES,
         default=lang.LANG_AUTO,
         help=lang.t("cli_lang_help"),
     )
@@ -1267,25 +1542,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # --host/--port/--lang require rebuilding settings (the dataclass is frozen).
     # B3: falsy CLI values must not be swallowed -- "--port 0" is an explicit value,
-    # not "unset". The rebuilt singletons are mirrored into probe_runner, which owns
-    # the runtime state the orchestration functions actually read.
+    # not "unset". The rebuild and the adoption in both runtime holders happen in one
+    # place, so the two cannot drift apart (I9).
     #
     # --host/--port/--lang 需要重新构造 settings（dataclass 是 frozen 的）。
     # B3：falsy 的 CLI 值不能被吞掉——"--port 0" 是显式赋值，不是"未提供"。
-    # 重建后的单例同步到 probe_runner——编排函数读取的运行时状态以它为准。
-    global settings, upstream
-    if args.host is not None or args.port is not None or args.lang != lang.LANG_AUTO:
-        import dataclasses
-
-        settings = dataclasses.replace(
-            settings,
-            proxy_host=args.host if args.host is not None else settings.proxy_host,
-            proxy_port=args.port if args.port is not None else settings.proxy_port,
-            language=lang.resolve_language(args.lang),
-        )
-        upstream = UpstreamClient(settings)
-        probe_runner.settings = settings
-        probe_runner.upstream = upstream
+    # 重建与"在两个运行时持有者中一并采纳"都收敛在同一处，使两者不可能各自漂移（I9）。
+    _apply_cli_overrides(args)
 
     # Apply the effective language before any user-facing output (logs, banner, errors)
     # 在产生任何用户可见输出（日志、横幅、错误）之前应用生效语言

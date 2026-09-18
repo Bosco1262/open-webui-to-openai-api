@@ -43,7 +43,7 @@ flowchart LR
 - **可选 CORS**：配置 `PROXY_CORS_ORIGINS` 后浏览器页面可以直连本代理（预检自动应答）；默认关闭，不扩大暴露面。
 - **模型别名**：通过 `MODEL_ALIASES` 把客户端请求的模型名映射到上游真实模型名。
 - **凭证脱敏**：日志里只打印 Token 前缀与长度，不落盘完整凭证。
-- **默认即加固**：兜底透传默认是白名单而不是"全量透传"；上游重定向被拒绝、绝不带着凭证跟随；上游的 `Set-Cookie` / `WWW-Authenticate` 不会到达客户端；请求体边读边计数（chunked 同样受限）；上游错误细节只进日志；每个请求都带可 grep 的关联 id。
+- **默认即加固**：兜底透传默认是白名单而不是"全量透传"（校验基于归一化后的路径，`images/../../api/...` 逃不出去）；上游重定向被拒绝、绝不带着凭证跟随；上游的 `Set-Cookie` / `WWW-Authenticate` 不会到达客户端；请求体边读边计数（chunked 同样受限，且覆盖所有路由）；同一地址反复猜错代理 Key 会被节流；上游错误细节只进日志；每个请求都带可 grep 的关联 id。
 
 ## 安全默认值一览
 
@@ -54,7 +54,9 @@ flowchart LR
 | 上游 3xx 应答 | 拒绝（绝不跟随） | 把 `OPEN_WEBUI_BASE_URL` 改为最终地址 |
 | 上游 `Set-Cookie` / `WWW-Authenticate` | 剔除 | —（客户端用代理 Key 鉴权） |
 | 局域网/非回环主机上的明文 http 上游 | 接受，仅启动时提示一次 | 前面加一层 TLS 反向代理，或确认链路可信 |
-| 请求体大小 | 边读边封顶（`MAX_BODY_BYTES`，10 MiB） | `MAX_BODY_BYTES` |
+| 请求体大小 | 边读边封顶（`MAX_BODY_BYTES`，10 MiB），**所有路由**（含兜底透传） | `MAX_BODY_BYTES` |
+| 无效代理 Key | 同一客户端地址在 `AUTH_FAILURE_WINDOW` 内失败达 `AUTH_FAILURE_LIMIT` 次后，该地址收到 429 + `Retry-After` | `AUTH_FAILURE_LIMIT`（0 = 关闭）、`AUTH_FAILURE_WINDOW` |
+| 免鉴权的 `/` 与 `/healthz` | 只回最小响应体（`{"status": "ok"}` / 服务名 + 版本）；凭证状态、端点清单、上游地址、探测健康都需要有效 Key | — |
 | 响应头 | `X-Request-ID`、`Cache-Control: no-store, private`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` | — |
 
 ## 目录结构
@@ -72,6 +74,7 @@ flowchart LR
 ├── atomic_json.py          # 共用的原子（flush + fsync + rename）JSON 写入
 ├── request_context.py      # 逐请求关联 id（contextvar + 日志格式化器）
 ├── requirements.txt        # 运行服务的最小依赖
+├── requirements.lock       # 锁定并带哈希的运行时集合（可复现安装）
 ├── requirements-browser.txt# 可选：浏览器登录所需的 Playwright
 ├── requirements-dev.txt    # 可选：运行测试所需的 pytest
 ├── .env.example            # 配置模板
@@ -90,6 +93,16 @@ Python 3.11+（探测刷新路径使用了 `asyncio.TaskGroup`）：
 ```bash
 pip install -r requirements.txt
 ```
+
+需要可复现安装时，用本版本验证过的精确版本 + 哈希安装全部运行时依赖：
+
+```bash
+pip install --require-hashes -r requirements.lock
+```
+
+`requirements.lock` 生成于 CPython 3.13 / Windows；带平台标记的 wheel（`pydantic-core`）
+在别处并不相同，请在目标平台上用 `uv pip compile --generate-hashes requirements.txt`
+（或 `pip-compile --generate-hashes`）重新生成。
 
 如果要用「浏览器登录抓取凭证」这条路径，还需要：
 
@@ -139,12 +152,13 @@ python app.py --port 9000  # 临时覆盖监听端口
 输出语言（日志、启动横幅、CLI 帮助、错误消息）：
 
 ```bash
-python app.py --lang zh    # 强制中文输出
-python app.py --lang en    # 强制英文输出
-python app.py --lang auto  # 跟随系统语言（默认），检测不到时用英文
+python app.py --lang zh     # 强制中文输出
+python app.py --lang zh-CN  # 等同于 zh，zh-CN 作为别名同样接受
+python app.py --lang en     # 强制英文输出
+python app.py --lang auto   # 跟随系统语言（默认），检测不到时用英文
 ```
 
-选择优先级：`--lang` 参数 > 系统语言检测 > 英文。
+选择优先级：`--lang` 参数（亦可写作 `-l` / `--language`）> 系统语言检测 > 英文。
 
 ### 4. 接入客户端
 
@@ -205,13 +219,13 @@ for await (const part of stream) {
 
 | 方法   | 路径                     | 鉴权 | 说明                        |
 | ---- | ---------------------- | -- | ------------------------- |
-| GET  | `/`                    | 否* | 服务信息与已注册端点；上游地址仅在带 Key 时返回 |
-| GET  | `/healthz`             | 否* | 健康检查恒 200；上游地址、探测前缀与探测健康状态仅在带 Key 时返回 |
+| GET  | `/`                    | 否* | 服务名与版本；其余内容（已注册端点、凭证状态、上游地址）仅在带 Key 时返回 |
+| GET  | `/healthz`             | 否* | 健康检查恒 200；不带 Key 时响应体只有 `{"status": "ok"}` —— 版本、凭证状态、上游地址、探测前缀与探测健康都需要有效 Key |
 | GET  | `/v1/models`           | 是  | 模型列表，已规范化为 OpenAI 结构，并附带实证的能力 / 参数 / 思考挡位；信封还带 `x_open_webui` 实例元信息 |
 | GET  | `/v1/models/{id}`      | 是  | 获取单个模型（`id` 可含斜杠）；未知 id 返回 OpenAI 风格 404 错误体 |
 | POST | `/v1/chat/completions` | 是  | 对话补全，支持 `stream: true`    |
 | POST | `/v1/embeddings`       | 是  | 向量嵌入（上游需支持）               |
-| ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径，但受 `PASSTHROUGH_ALLOW` 约束（默认 `images`、`audio`、`files`、`responses`）；其余路径直接 403，不碰上游 |
+| ANY  | `/v1/{path}`           | 是  | 兜底透传，转发到上游同路径，但受 `PASSTHROUGH_ALLOW` 约束（默认 `images`、`audio`、`files`、`responses`）；其余路径直接 403，不碰上游。路径在校验与转发前先归一化，因此 `..` 段无法逃出白名单 |
 
 鉴权支持 `Authorization: Bearer <key>` 与 `X-API-Key: <key>` 两种写法，`PROXY_API_KEY` 与 `PROXY_API_KEYS` 里的任意一把都可通过。两者都为空时不鉴权。
 
@@ -219,7 +233,7 @@ for await (const part of stream) {
 
 `/v1/models` 的查询参数会被忽略，这与 OpenAI 官方端点一致（它本身没有分页；只有 Anthropic 与 Gemini 那两种不同形状的 API 才实现了分页）。
 
-\* `/` 与 `/healthz` 保持免鉴权（探针与就绪检查友好），但响应里的 `upstream` / `upstream_prefix` 字段只在请求携带有效 Key（或未启用鉴权）时返回，避免公网部署时泄漏上游内网域名。
+\* `/` 与 `/healthz` 保持免鉴权（探针与就绪检查友好），但不带有效 Key 时只返回最小响应体：`/` 回服务名与版本，`/healthz` 回 `{"status": "ok"}`。凭证状态、端点清单与 `upstream` / `upstream_prefix` 字段只对通过鉴权的调用方返回（或完全未启用鉴权时），因此公网部署不会顺手交出自身拓扑。
 
 ## 配置项
 
@@ -246,6 +260,8 @@ for await (const part of stream) {
 | `MAX_BODY_BYTES`          | `10485760`      | 拒绝超过该字节数的 JSON 请求体（413）。边读边计数，因此无 `Content-Length` 的 chunked 请求体同样受限 |
 | `MODEL_LIST_TTL`          | `10`            | 上游模型列表的复用秒数，超时后重新拉取；`0` = 每次请求都拉取            |
 | `ALLOW_INSECURE`          | `false`         | 安全联锁覆盖：允许在没有配置任何代理 Key 时监听非回环地址启动     |
+| `AUTH_FAILURE_LIMIT`      | `10`            | 同一客户端地址失败多少次代理 Key 后开始收到 429 + `Retry-After`；`0` 关闭节流 |
+| `AUTH_FAILURE_WINDOW`     | `60`            | 上述失败计数的时间窗口（秒）                                     |
 | `PASSTHROUGH_ALLOW`       | `images,audio,files,responses` | `/v1/*` 兜底透传允许转发的子路径（精确或子路径匹配）。`*` = 不设限（历史上的行为）；显式空值 = 一条都不放行 |
 | `MODEL_ALIASES`       | 空                       | JSON 对象，模型名映射                          |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`，非法值回退 `INFO` |

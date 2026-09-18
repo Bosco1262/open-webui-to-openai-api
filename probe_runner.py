@@ -17,6 +17,7 @@ The singletons live here rather than in app.py so that tests can patch
 `probe_runner.upstream` / `probe_runner.model_probe` and have the orchestration
 functions actually see the replacement.
 
+
 上游数据访问与逐模型探测编排。
 
 本模块持有进程级运行时单例（共享的 UpstreamClient 与 ModelProbeCache），以及
@@ -69,7 +70,7 @@ from model_probe import (
     vision_payload,
 )
 from models import _model_summaries
-from request_context import request_id_suffix
+from request_context import bind_request_id, request_id_suffix, sanitize_log_text
 from session_store import SessionError, load_session, session_exists
 from upstream import (
     AUTH_FAILURE_CODES,
@@ -96,6 +97,36 @@ upstream = UpstreamClient(settings)
 # Per-model probe cache (loaded lazily; persisted next to session.json)
 # 逐模型探测缓存（惰性加载；持久化在 session.json 旁边）
 model_probe = ModelProbeCache(settings.model_probe_cache_file)
+
+
+def use_settings(new_settings: Settings) -> UpstreamClient:
+    """
+    Adopt `new_settings` as this module's runtime settings, and return the fresh upstream
+    client that goes with it (I9).
+
+    `config.settings` is the value loaded at import time -- the startup default, not the
+    runtime instance. When `app.main` rebuilds the frozen dataclass for --host/--port/
+    --lang, both holders of the live object (the app module and this one) have to change
+    together, and doing both halves in one place is what makes "adopt it here, forget it
+    there" impossible: the module that owns the orchestration state is also the one that
+    knows it needs a matching client.
+
+    Logging level and language are applied by the caller, not here.
+
+
+    把 `new_settings` 作为本模块的运行时设置，并返回与之配套的新上游客户端（I9）。
+
+    `config.settings` 是 import 期加载的值——启动默认值，而非运行时实例。`app.main` 为
+    --host/--port/--lang 重建这个 frozen dataclass 时，两个运行时持有者（app 模块与本模块）
+    必须一起换；把两半放在同一处，才使"这边采纳了、那边忘了"成为不可能：持有编排状态的
+    模块本来就知道自己需要一个与之匹配的客户端。
+
+    日志级别与语言由调用方应用，不在此处。
+    """
+    global settings, upstream
+    settings = new_settings
+    upstream = UpstreamClient(new_settings)
+    return upstream
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +166,7 @@ def _http_error(status_code: int, message: str, **error_fields: Any) -> HttpErro
 # the upstream as a whole, `auth_rejected`/`no_session` name a credential problem the
 # operator has to fix.
 #
+#
 # 探测健康状态。观察到任何事实前为 `unknown`；`ok`/`degraded` 描述上游整体状况，
 # `auth_rejected`/`no_session` 则点名了必须由运维处理的凭证问题。
 PROBE_HEALTH_UNKNOWN = "unknown"
@@ -163,6 +195,7 @@ class ProbeHealth:
     reads the logs: the refresh loop retries quietly, every round logs a failed model
     or two, and nothing says "log in again".
 
+
     探测子系统最近观察到的情况，供 /healthz 与 --check 输出（U-11）。
 
     它存在的全部意义在于："会话死了"这件事过去只有翻日志的人才知道：刷新循环安静地
@@ -178,6 +211,7 @@ class ProbeHealth:
     last_round: Optional[Dict[str, Any]] = None
     # Whether the prominent warning was already emitted for the current streak, so the
     # failure is announced once instead of once per round.
+    #
     # 当前这串连续失败是否已经发过那条醒目告警，使失败只被宣布一次而不是每轮一次。
     warned: bool = False
 
@@ -328,6 +362,7 @@ async def _startup_check(*, quiet_success: bool = False) -> bool:
     `quiet_success=True` (the --check path) skips the success line: the caller
     prints its own single summary instead of two overlapping messages (R11).
 
+
     启动时校验凭证与上游连通性。返回 True 表示凭证可用。
 
     `quiet_success=True`（--check 路径）跳过成功日志：由调用方输出一份
@@ -407,6 +442,7 @@ async def _startup_check(*, quiet_success: bool = False) -> bool:
 # Upstream statuses meaning "the engine rejected the request body", i.e. the probe
 # learned something definite. Anything else (404, 5xx) is transient.
 #
+#
 # 表示"引擎拒绝了请求体"的上游状态码，即探测学到了确定的东西。其它（404、5xx）
 # 都是暂时性的。
 VALIDATION_FAILURE_CODES = (400, 422)
@@ -478,6 +514,7 @@ async def _probe_model(
 
     Raises _ProbeAuthExpired (abort the whole refresh) or _ProbeTransient (retry the
     model later); every other outcome is a ModelProbe, complete or partial.
+
 
     通过"问引擎"确立单个模型接受什么。
 
@@ -746,6 +783,7 @@ async def _get_models_or_unavailable(session: Any) -> httpx.Response:
     session.json) answers 400 with the reason instead of escaping as an opaque 500 --
     the same classification the chat path uses (B12).
 
+
     GET /models，并把失败翻译成 OpenAI 风格的 HttpError。
 
     本进程连构造都做不到的请求（session.json 里有无法编码的头值）以 400 带上原因作答，
@@ -779,6 +817,7 @@ async def _fetch_raw_models(session: Any) -> List[Any]:
     cache would pin every future models request to the dead route until restart. The
     prefix is re-probed once; the request is retried a single time when the probe
     settles on a different prefix.
+
 
     GET 上游模型列表并返回原始条目。
 
@@ -821,9 +860,13 @@ async def _fetch_raw_models(session: Any) -> List[Any]:
             # returned HTTP 502" would be the end of the trail.
             #
             # 细节无条件进日志（U-6）：默认脱敏时它是细节唯一存在的地方；没有它，
-            # "上游 /models 返回 HTTP 502" 就是线索的尽头。
+            # "上游 /models 返回 HTTP 502" 就是线索的尽头。上游响应体先清洗控制字符（L1）。
             logger.warning(
-                lang.t("upstream_models_error_log", status=resp.status_code, text=resp.text[:500])
+                lang.t(
+                    "upstream_models_error_log",
+                    status=resp.status_code,
+                    text=sanitize_log_text(resp.text[:500]),
+                )
             )
             message = (
                 lang.t("err_upstream_models_http", status=resp.status_code, text=resp.text[:500])
@@ -840,7 +883,12 @@ async def _fetch_raw_models(session: Any) -> List[Any]:
         try:
             payload = resp.json()
         except ValueError:
-            logger.warning(lang.t("upstream_models_not_json_log", text=resp.text[:500]))
+            logger.warning(
+                lang.t(
+                    "upstream_models_not_json_log",
+                    text=sanitize_log_text(resp.text[:500]),
+                )
+            )
             message = (
                 lang.t("err_upstream_models_not_json", text=resp.text[:500])
                 if settings.expose_upstream_error
@@ -899,6 +947,7 @@ async def _fetch_model_summaries(session: Any) -> Optional[List[Tuple[str, str]]
     module only consumes them. That import used to go through app (a local import to
     dodge the cycle); with the normalization split out in R5 it is a plain module
     dependency, and this module no longer reaches back into the app layer at all.
+
 
     拉取上游模型列表并归约为 (模型 id, 引擎指纹) 对；None 表示拉取失败
     （调用方跳过本轮刷新）。
@@ -1009,6 +1058,32 @@ async def _refresh_instance_meta(session: Any) -> None:
         _instance_meta.features = features
 
 
+async def _await_instance_meta(task: asyncio.Task) -> None:
+    """
+    Wait for an in-flight /api/config refresh, at most INSTANCE_META_WAIT, without ever
+    failing the caller.
+
+    A timeout only ends the *wait* -- the shield keeps the refresh running for the next
+    requester -- and is therefore expected and silent. Any other exception is a genuine
+    defect (upstream failures are already turned into None by get_instance_config) and
+    is logged rather than swallowed (I2): it used to disappear entirely, leaving
+    "x_open_webui is always missing" as the only symptom to debug from.
+
+
+    等待在飞的 /api/config 刷新，最多 INSTANCE_META_WAIT，且绝不让调用方失败。
+
+    超时只结束**等待**——shield 让刷新继续运行、供下一个请求复用——因此它是预期内的，静默处理。
+    其它异常属于真实缺陷（上游失败已被 get_instance_config 转成 None），这里记一行日志而不是
+    吞掉（I2）：它过去会彻底消失，使"x_open_webui 一直缺失"成为唯一可用于排障的现象。
+    """
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=INSTANCE_META_WAIT)
+    except asyncio.TimeoutError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - bonus metadata must never fail the caller
+        logger.warning(lang.t("instance_meta_wait_failed", exc=exc))
+
+
 async def _ensure_instance_meta(session: Any) -> None:
     """
     Refresh the /api/config snapshot when it is stale. Best effort: a failure keeps
@@ -1024,21 +1099,11 @@ async def _ensure_instance_meta(session: Any) -> None:
     if _instance_meta.is_fresh(now) or _instance_meta.recently_attempted(now):
         return
     if _instance_meta_task is not None and not _instance_meta_task.done():
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(_instance_meta_task), timeout=INSTANCE_META_WAIT
-            )
-        except (asyncio.TimeoutError, Exception):
-            pass
+        await _await_instance_meta(_instance_meta_task)
         return
     _instance_meta.attempted_at = now
     _instance_meta_task = _spawn_background_task(_refresh_instance_meta(session))
-    try:
-        await asyncio.wait_for(
-            asyncio.shield(_instance_meta_task), timeout=INSTANCE_META_WAIT
-        )
-    except (asyncio.TimeoutError, Exception):
-        pass
+    await _await_instance_meta(_instance_meta_task)
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,6 +1226,7 @@ def _refresh_mutex() -> asyncio.Lock:
     uvicorn never uses -- and on Python 3.9 that binding happens even earlier. Creating
     it on first use always yields a lock of the current loop.
 
+
     刷新互斥锁，首次使用时惰性创建。
 
     asyncio 原语会绑定到首次使用它的事件循环，因此在 import 期构造的锁可能属于一个
@@ -1201,6 +1267,7 @@ async def _refresh_model_probe_locked(
 
     With force=False this is a no-op when every current model already has a conclusive
     entry for its engine fingerprint -- the "unchanged engine -> serve cache" contract.
+
 
     将探测缓存与当前模型列表对齐，探测缺失或过期的模型，持久化，并汇报结果。
 
@@ -1391,7 +1458,7 @@ def _spawn_model_probe_refresh(
         except Exception as exc:  # noqa: BLE001 - background task must not die silently
             logger.warning(lang.t("probe_task_error", exc=exc))
 
-    _refresh_task = asyncio.create_task(runner())
+    _refresh_task = asyncio.create_task(_in_detached_context(runner()))
     return _refresh_task
 
 
@@ -1412,14 +1479,35 @@ _healing: Set[str] = set()
 _background_tasks: Set[asyncio.Task] = set()
 
 
+async def _in_detached_context(coro: Any) -> Any:
+    """
+    Run background work with no request id (L5).
+
+    asyncio.create_task() copies the current context, so a task spawned while handling a
+    request inherited that request's correlation id: the probe and heal log lines it
+    produced were stamped with the id of whichever client happened to trigger them,
+    which makes grepping by id misleading rather than useful. Clearing it inside the
+    task touches only the task's own context, never the request's.
+
+    在"没有请求 id"的上下文里运行后台工作（L5）。
+
+    asyncio.create_task() 会复制当前上下文，因此在处理请求时派生的任务会继承该请求的关联
+    id：它产生的探测与自愈日志会被打上"恰好触发了它的那个客户端"的 id，让按 id 检索日志
+    从有用变成误导。在任务内部清空只影响该任务自己的上下文，不影响请求。
+    """
+    bind_request_id("")
+    return await coro
+
+
 def _spawn_background_task(coro: Any) -> asyncio.Task:
     """
     Create a fire-and-forget background task that cannot disappear to garbage
-    collection before it finishes.
+    collection before it finishes, and that carries no request id of its own (L5).
 
-    创建一个"发射后不管"的后台任务，保证它在完成之前不会被垃圾回收掉。
+    创建一个"发射后不管"的后台任务：保证它在完成之前不会被垃圾回收掉，且不携带任何
+    请求 id（L5）。
     """
-    task = asyncio.create_task(coro)
+    task = asyncio.create_task(_in_detached_context(coro))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
@@ -1440,6 +1528,7 @@ def _trigger_probe_heal(model_id: Optional[str], effort: Optional[str]) -> None:
     * the invalidation happens BEFORE the re-entrancy check: a second live 400 for
       a model whose heal is already running must still drop its level, only the
       extra re-probe is skipped.
+
 
     对线上"关于思考挡位"的上游 400 作出反应：立即从缓存里剔除被证伪的挡位，并在
     后台重探该模型。发现问题的那个请求绝不因此被拖延。

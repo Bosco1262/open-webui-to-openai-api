@@ -9,6 +9,7 @@ The id lives in a contextvar rather than being threaded through every function
 signature: the logging formatter and the error builders read it at the point of use,
 which is exactly the set of places that need it.
 
+
 每个进入请求的关联 id（U-7）：随该请求产生的每一行日志携带，并在响应头里回显。
 
 没有它时，客户端报告的"上游报错了"无法与解释原因的那行日志对上——运维只能靠时间戳猜。
@@ -40,6 +41,25 @@ REQUEST_ID_MAX_LENGTH = 64
 # 仅保留在响应头里安全、在日志行里可读的字符。其余（首当其冲是换行——经典的日志伪造）
 # 一律丢弃而不是转义，使伪造的 id 永远无法造出第二行日志。
 _SAFE_REQUEST_ID = re.compile(r"[^A-Za-z0-9._:-]")
+
+# Control characters (carriage returns and newlines above all) must never reach a log
+# line: a client-supplied path or an upstream error body carrying one forges a second
+# log entry (CWE-117). Dropped rather than escaped, same policy as the request id.
+#
+# 控制字符（首当其冲是回车与换行）绝不能进入日志行：客户端提供的路径或上游错误体
+# 携带它就能伪造一条日志记录（CWE-117）。与 request id 同一策略：丢弃而不是转义。
+_UNSAFE_LOG_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def sanitize_log_text(value: object) -> str:
+    """
+    Reduce untrusted text (a client path, an upstream body) to something safe to embed
+    in a single log line.
+
+    把不可信文本（客户端路径、上游响应体）收敛为可安全嵌入单行日志的形式。
+    """
+    return _UNSAFE_LOG_CHARS.sub("", str(value))
+
 
 # The id of the request currently being handled; "" outside a request (startup, CLI).
 # Each request runs in its own task, so setting without resetting cannot leak into

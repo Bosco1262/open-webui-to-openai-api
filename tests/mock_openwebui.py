@@ -6,6 +6,7 @@ behaviors of both upstream versions:
   - Legacy: /api/models, /api/chat/completions
   - Modern: /api/v1/models, /api/v1/chat/completions, /api/v1/embeddings
 
+
 一个最小化的 Open WebUI 上游模拟器，仅用于本地冒烟测试。
 
 用标准库实现，不引入任何额外依赖。它模拟了上游两个版本的关键行为：
@@ -349,6 +350,7 @@ class _Handler(BaseHTTPRequestHandler):
         Compression stays conditional (httpx only advertises gzip when it can decode
         it), so these tests also work with an httpx built without compression support.
 
+
         调用方接受 gzip 时发送压缩响应。
 
         压缩是有条件的（httpx 只有在能解码时才会声明 gzip），因此测试在缺少压缩支持的
@@ -394,6 +396,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
         _record_hit("GET", path)
+        # The full target (query included), so a test can assert what the proxy actually
+        # forwarded after rebuilding the query (L2).
+        #
+        # 完整目标（含查询串），使测试可以断言代理重建查询串后真正转发了什么（L2）。
+        _record_hit("GET-FULL", self.path)
         # Both handled before the auth check on purpose: a 5xx and the SPA's 200 + HTML
         # page are exactly the answers that say nothing about the credentials.
         #
@@ -403,6 +410,23 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in SPA_PATHS:
             self._send_html()
+            return
+        if path in ("/api/images/weird-header", "/api/v1/images/weird-header"):
+            # A response header whose value is valid UTF-8 but NOT valid latin-1 (M1):
+            # the proxy decodes upstream headers as UTF-8 and re-encodes as latin-1, so
+            # this used to raise and turn the route into a 500.
+            #
+            # 一个值合法 UTF-8、却非法 latin-1 的响应头（M1）：代理按 UTF-8 解上游响应头、
+            # 按 latin-1 重编码，因此过去会抛异常并把路由变成 500。
+            if not self._authorized(self.headers):
+                self._send_json(401, {"detail": "Not authenticated"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self._headers_buffer.append("X-Weird: 中\r\n".encode("utf-8"))
+            self.end_headers()
+            self.wfile.write(b"{}")
             return
         if path in ("/api/models", "/api/v1/models"):
             if not self._authorized(self.headers):
@@ -550,6 +574,7 @@ class _Handler(BaseHTTPRequestHandler):
         The Location is built from the request's own Host header so the target is a
         real, reachable path here: if the proxy followed the redirect, HIT_COUNTS
         would show it.
+
 
         返回 302，指向本服务器自身（U-3）。
 
@@ -731,6 +756,7 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
     The proxy opens and closes many short-lived connections while probing, and the
     socketserver default handler treats every client-side reset as a server error --
     which buries the real test output in noise.
+
 
     一个不会因客户端消失而倾倒 traceback 的多线程服务器。
 

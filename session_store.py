@@ -4,6 +4,7 @@ Credential management: load/save session.json, plus optional browser-based login
 session.json stores exactly the request headers needed to access Open WebUI after a
 browser login; this project never parses or uploads these credentials in any way.
 
+
 凭证管理：加载/保存 session.json，以及可选的浏览器登录抓取。
 
 session.json 里存的就是浏览器登录后访问 Open WebUI 所需的请求头，
@@ -67,6 +68,7 @@ def looks_like_model_list(response: httpx.Response) -> bool:
     validation (see _credentials_are_valid) -- must therefore look at the body, not
     just the status code.
 
+
     2xx 的 /models 回答是否真的是模型列表。
 
     Open WebUI 的 SPA 会用 HTTP 200 + 一页 HTML 回答未知路径，因此单凭 2xx 既不能证明
@@ -118,6 +120,13 @@ class Session:
         return bool(self.authorization.strip() or self.cookie.strip())
 
     def to_headers(self) -> Dict[str, str]:
+        """
+        Build the header set forwarded upstream: the JSON Accept/Content-Type pair, the
+        user agent, and the captured Authorization / Cookie when present.
+
+        构造转发给上游的请求头：JSON 的 Accept/Content-Type 组合、User-Agent，以及
+        抓到的 Authorization / Cookie（仅在有值时携带）。
+        """
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -135,6 +144,7 @@ class Session:
 
         Early single-file versions wrote Authorization / Cookie / User-Agent; we no
         longer write both key styles (from_dict accepts both, so readers need not care).
+
 
         只写 snake_case 一种键名。
 
@@ -155,6 +165,7 @@ class Session:
         The token prefix is shortened to 8 characters: for a JWT that is already almost
         no information, and for a hand-made token it limits how much of a secret ends up
         in a log line (R12).
+
 
         返回脱敏后的凭证摘要，可安全写进日志。
 
@@ -256,6 +267,7 @@ def _assert_base_url_matches(settings: Settings, session: Session) -> None:
     An empty `base_url` (files written by older versions, or a hand-edited file) is
     allowed: there is nothing to compare against.
 
+
     拒绝为另一个上游抓取的凭证（D7）。
 
     `base_url` 从一开始就记录在文件里，却从未被读取，于是把 OPEN_WEBUI_BASE_URL 指向
@@ -281,6 +293,16 @@ def _assert_base_url_matches(settings: Settings, session: Session) -> None:
 
 
 def load_session(settings: Settings) -> Session:
+    """
+    Load the credential file, validating it on the way in: a missing file raises
+    SessionMissing; unreadable, unparseable, unusable or wrong-upstream files raise
+    SessionInvalid. The parsed Session is cached by (mtime, size), so repeat calls
+    cost one stat.
+
+    读取凭证文件并在读取途中完成校验：文件缺失抛 SessionMissing；不可读、不可解析、
+    不可用或属于另一个上游的文件抛 SessionInvalid。解析结果按 (mtime, size) 缓存，
+    重复调用只多付一次 stat。
+    """
     path: Path = settings.session_file
     try:
         stat = path.stat()
@@ -396,6 +418,7 @@ def is_login_signal(url: str, headers: Dict[str, str], api_prefix: str) -> bool:
       so additionally require the request to hit an endpoint that the frontend only
       calls when logged in.
 
+
     判断一个请求是否说明"用户已经登录了"。
 
     拆成纯函数是为了可以脱离 Playwright 单独测试。
@@ -443,6 +466,7 @@ async def _credentials_are_valid(settings: Settings, session: Session) -> bool:
     network errors are all judged invalid; 404 means trying the next candidate prefix;
     and a 2xx whose body is not the model list (the SPA's 200 + HTML page for an
     unknown path) proves nothing either, so that also moves on to the next candidate.
+
 
     对上游做一次真实请求，校验抓到的凭证当前是否有效。
 
@@ -492,6 +516,7 @@ async def _launch_browser(playwright: Any, *, headless: bool) -> Any:
     SessionError, so the operator got a page of Playwright stack instead of the two
     lines that actually solve it (D9).
 
+
     启动 Chromium，并把所有失败翻译成附带解决办法的 SessionError。
 
     浏览器未安装（没执行过 `playwright install chromium`）或在无显示器的服务器上运行时，
@@ -536,6 +561,7 @@ async def perform_browser_login(
     load, and the expired old token probe requests sent early in page load, are
     never saved as a valid login state.
 
+
     打开浏览器让用户手动登录，抓取登录后的请求头。
 
     判定"登录成功"的标准比"存在 Cookie"严格得多：
@@ -562,6 +588,14 @@ async def perform_browser_login(
     event = asyncio.Event()
 
     async def on_request(request) -> None:
+        """
+        Playwright request hook: capture the credential headers of requests that carry
+        real identity information (is_login_signal filters out the anonymous first-load
+        cookies). A failure here is logged and never breaks the login flow.
+
+        Playwright 请求钩子：抓取携带真实身份信息的请求头（首屏匿名 Cookie 会被
+        is_login_signal 挡掉）。此处异常只记日志，绝不打断登录流程。
+        """
         try:
             url = str(request.url)
             headers = _normalize_headers(await request.all_headers())
@@ -663,6 +697,7 @@ async def _enrich_from_browser(page, context, settings: Settings, session: Sessi
     The cookie in request headers may be incomplete; Open WebUI also stores its JWT
     in the `token` key of localStorage, so reading it directly yields the most
     complete identity information.
+
 
     补充抓取 localStorage 里的 token 与完整 Cookie Jar。
 

@@ -4,6 +4,7 @@ End-to-end smoke tests: mock upstream + real proxy startup, verifying OpenAI-com
 Run from the project root:
     python tests/test_smoke.py
 
+
 端到端冒烟测试：mock 上游 + 真实启动本代理，验证 OpenAI 兼容行为。
 
 运行方式（项目根目录）：
@@ -94,6 +95,35 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def raw_socket_request(port: int, target: str, extra_headers: Optional[Dict[str, str]] = None) -> str:
+    """
+    Send one GET over a raw socket, so the request line reaches the server verbatim.
+
+    Needed for the cases an HTTP client library rewrites before sending: a literal "#"
+    inside the query (L2), and percent-encoded dot segments httpx would otherwise
+    resolve away (H1).
+
+    通过原始 socket 发送一次 GET，使请求行原样抵达服务端。
+
+    用于 HTTP 客户端库会在发送前改写的那些情形：查询串里的字面 "#"（L2），以及 httpx 会
+    提前解析掉的百分号编码点段（H1）。
+    """
+    request = f"GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n"
+    for name, value in (extra_headers or {}).items():
+        request += f"{name}: {value}\r\n"
+    request += "\r\n"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=15) as connection:
+        connection.sendall(request.encode("latin-1"))
+        chunks = []
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks).decode("latin-1", "replace")
 
 
 def wait_ready(url: str, timeout: float = 30.0) -> bool:
@@ -271,21 +301,23 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
 
         client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
 
-        # 1. healthz: usable without auth, but the upstream address is only returned with a key
-        # 1. healthz：免鉴权可用，但上游地址只在带 Key 时返回
+        # 1. healthz: usable without auth, but without a key the body is only
+        #    {"status": "ok"} -- everything else needs a valid key (L4)
+        # 1. healthz：免鉴权可用，但不带 Key 时响应体只有 {"status": "ok"}——
+        #    其余信息都需要有效 Key（L4）
         resp = client.get("/healthz")
         body = resp.json()
         check(f"[{style}] /healthz 无 Key 也可用", resp.status_code == 200, str(body))
         check(
-            f"[{style}] 无 Key 时隐藏上游地址",
-            "upstream" not in body and "upstream_prefix" not in body,
+            f"[{style}] 无 Key 时只回最小信息（L4）",
+            body == {"status": "ok"},
             str(body),
         )
-        check(f"[{style}] 无 Key 时报告需要鉴权", body.get("auth_required") is True, str(body))
 
         resp = client.get("/healthz", headers=headers())
         body = resp.json()
         check(f"[{style}] 带 Key 的 /healthz 返回 200", resp.status_code == 200, str(body))
+        check(f"[{style}] 带 Key 时报告需要鉴权", body.get("auth_required") is True, str(body))
         check(
             f"[{style}] 带 Key 时前缀探测为 {expected_prefix}",
             body.get("upstream_prefix") == expected_prefix,
@@ -297,7 +329,11 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         # 1b. / 元信息同样"带 Key 才暴露上游地址"
         resp = client.get("/")
         body = resp.json()
-        check(f"[{style}] / 无 Key 时隐藏上游地址", "upstream" not in body, str(body))
+        check(
+            f"[{style}] / 无 Key 时只回服务名与版本（L4）",
+            set(body) <= {"service", "version"} and "session_ready" not in body and "endpoints" not in body,
+            str(body),
+        )
         resp = client.get("/", headers=headers())
         body = resp.json()
         check(
@@ -317,6 +353,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
 
         # 1d. U-7: every response carries a correlation id, and a client-supplied one is
         #     kept (sanitized) so a client can quote it when reporting a problem.
+        #
         # 1d. U-7：每个响应都带关联 id；客户端提供的会被保留（已清洗），便于反馈问题时引用。
         resp = client.get("/healthz", headers={"X-Request-ID": "smoke-req-123"})
         check(
@@ -343,6 +380,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
 
         # 1e. U-9: responses carrying deployment information must not be cached, and the
         #     static hardening headers are applied everywhere.
+        #
         # 1e. U-9：携带部署信息的响应不得被缓存，静态加固头对所有响应生效。
         resp = client.get("/healthz")
         check(
@@ -473,6 +511,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         # 5b. U-5: only a real JSON `true` streams. A hand-written client sending the
         #     string "false" used to be flipped into the streaming branch and waited for
         #     SSE it never asked for; it must get a complete JSON answer.
+        #
         # 5b. U-5：只有真正的 JSON `true` 才走流式。手写客户端把 "false" 写成字符串时，
         #     过去会被翻进流式分支、苦等一个它从没要求的 SSE；现在必须拿到完整 JSON。
         resp = client.post(
@@ -505,6 +544,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
 
         # 6b. U-6: by default the upstream's error text stays in the log; the client gets
         #     a fixed message plus the request id that ties it to that log line.
+        #
         # 6b. U-6：默认情况下上游错误原文只进日志；客户端收到固定文案 + 可与日志对上的 request id。
         check(
             f"[{style}] 默认不回显上游错误原文",
@@ -692,6 +732,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
 
         # 11. U-4: the upstream's session cookie must never reach the client -- it would
         #     be a working upstream session that bypasses this proxy entirely.
+        #
         # 11. U-4：上游的会话 Cookie 绝不下发客户端——那会是一份可完全绕过本代理的上游会话。
         resp = client.post(
             "/v1/chat/completions",
@@ -715,6 +756,7 @@ def run_case(server_url: str, style: str, expected_prefix: str) -> None:
         # 12. U-3: a redirect from the upstream is refused, never followed with the
         #     captured credentials attached. The mock points Location back at itself, so
         #     a followed redirect would leave a hit on REDIRECT_PATH.
+        #
         # 12. U-3：上游的重定向被拒绝，绝不带着抓到的凭证跟随。mock 把 Location 指回
         #     自己，因此一旦发生跟随，REDIRECT_PATH 上就会留下命中记录。
         resp = client.post(
@@ -1361,6 +1403,165 @@ def run_body_limit_case(server_url: str) -> None:
             resp.status_code == 200 and bool((resp.json() or {}).get("choices")),
             f"{resp.status_code} {resp.text[:160]}",
         )
+
+        # M2: the catch-all passthrough used to read its body with request.body(), so
+        # the documented cap did not apply to the one route that forwards file-sized
+        # payloads. It now shares the capped reader.
+        #
+        # M2：兜底透传过去用 request.body() 读体，因此那个写明的上限恰恰在"唯一会转发
+        # 文件级负载的路由"上不生效。它现在与其它路由共用限量读取。
+        resp = client.post(
+            "/v1/images",
+            headers={**headers(), "Content-Type": "application/octet-stream"},
+            content=b"x" * 4096,
+        )
+        check(
+            "[body-cap] 兜底透传同样受 MAX_BODY_BYTES 约束（M2）",
+            resp.status_code == 413
+            and (resp.json() or {}).get("error", {}).get("code") == "body_too_large",
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        resp = client.post(
+            "/v1/images",
+            headers={**headers(), "Content-Type": "application/octet-stream"},
+            content=b"x" * 512,
+        )
+        check(
+            "[body-cap] 兜底透传未超限的请求体照常转发",
+            resp.status_code not in (413,),
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_auth_throttle_case(server_url: str) -> None:
+    print("\n=== Scenario: proxy-key brute-force throttle (L3) / 场景：代理 Key 爆破节流（L3）===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", server_url)
+    proxy = ProxyProcess(
+        server_url,
+        session_file,
+        "auto",
+        extra_env={"AUTH_FAILURE_LIMIT": "3", "AUTH_FAILURE_WINDOW": "60"},
+    )
+    try:
+        if not proxy.wait():
+            check("[auth-throttle] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
+        wrong = {"Authorization": "Bearer definitely-not-the-key"}
+
+        codes = [client.get("/v1/models", headers=wrong).status_code for _ in range(3)]
+        check(
+            "[auth-throttle] 达到上限前仍是 401",
+            codes == [401, 401, 401],
+            str(codes),
+        )
+
+        resp = client.get("/v1/models", headers=wrong)
+        check(
+            "[auth-throttle] 超过上限后 429 且带 Retry-After",
+            resp.status_code == 429 and (resp.headers.get("retry-after") or "").isdigit(),
+            f"{resp.status_code} retry-after={resp.headers.get('retry-after')}",
+        )
+
+        resp = client.get("/v1/models", headers=headers())
+        check(
+            "[auth-throttle] 有效 Key 不被节流，并清零该地址的失败计数",
+            resp.status_code == 200,
+            f"{resp.status_code} {resp.text[:120]}",
+        )
+        resp = client.get("/v1/models", headers=wrong)
+        check(
+            "[auth-throttle] 成功鉴权后重新从 401 开始计数",
+            resp.status_code == 401,
+            f"{resp.status_code} {resp.text[:120]}",
+        )
+        client.close()
+    finally:
+        proxy.stop()
+
+
+def run_passthrough_security_case(server_url: str) -> None:
+    print("\n=== Scenario: passthrough hardening (H1/M1/L1/L2) / 场景：透传加固（H1/M1/L1/L2）===")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="owui-session-"))
+    session_file = make_session(tmp_dir / "session.json", server_url)
+    proxy = ProxyProcess(server_url, session_file, "auto")
+    try:
+        if not proxy.wait():
+            check("[passthrough-sec] 代理启动", False, proxy.dump_log())
+            return
+        client = httpx.Client(base_url=proxy.base, timeout=30.0, trust_env=False)
+
+        # H1: the traversal used to pass the allowlist and then be resolved by the HTTP
+        # client into /api/config -- the upstream must never be reached. Sent over a raw
+        # socket so the encoded dot segments reach the server exactly as an attacker
+        # would send them.
+        #
+        # H1：穿越路径过去能通过白名单，随后被 HTTP 客户端解析成 /api/config——
+        # 上游绝不该被碰到。用原始 socket 发送，使编码点段与攻击者的发法完全一致地抵达服务端。
+        before = dict(HIT_COUNTS)
+        raw_response = raw_socket_request(
+            proxy.port,
+            "/v1/images/%2e%2e/%2e%2e/%2e%2e/api/config",
+            {"Authorization": f"Bearer {PROXY_KEY}"},
+        )
+        touched = {
+            key: value
+            for key, value in HIT_COUNTS.items()
+            if before.get(key, 0) != value and "api/config" in key
+        }
+        check(
+            "[passthrough-sec] H1: 穿越路径被 403，且上游未被访问",
+            raw_response.startswith("HTTP/1.1 403") and not touched,
+            f"{raw_response.split(chr(13), 1)[0]!r} touched={touched}",
+        )
+
+        resp = client.get("/v1/images/x", headers=headers())
+        check(
+            "[passthrough-sec] 白名单内的正常子路径仍然转发（上游 404 而非本代理 403）",
+            resp.status_code == 404,
+            f"{resp.status_code} {resp.text[:120]}",
+        )
+
+        # M1: an upstream header outside latin-1 must not turn the route into a 500.
+        # M1：上游非 latin-1 响应头不得把路由变成 500。
+        resp = client.get("/v1/images/weird-header", headers=headers())
+        check(
+            "[passthrough-sec] M1: 非 latin-1 响应头被替换，路由不 500",
+            resp.status_code == 200,
+            f"{resp.status_code} {resp.text[:160]}",
+        )
+
+        # L2: the raw query is rebuilt from the wire bytes, so a literal "#" survives.
+        # L2：查询串按线上字节重建，因此字面 "#" 得以保留。
+        raw_target = "/v1/images/x?a=1#b=2"
+        before = dict(HIT_COUNTS)
+        raw_response = raw_socket_request(proxy.port, raw_target, {"Authorization": f"Bearer {PROXY_KEY}"})
+        raw_hits = [
+            key
+            for key, value in HIT_COUNTS.items()
+            if before.get(key, 0) != value and "GET-FULL" in key
+        ]
+        check(
+            "[passthrough-sec] L2: 字面 # 之后的查询串仍被转发（编码为 %23）",
+            any("a=1%23b=2" in key for key in raw_hits),
+            f"status_line={raw_response.split(chr(13), 1)[0]!r} hits={raw_hits}",
+        )
+
+        # L1: a CR smuggled into a refused path must not reach the log line.
+        # L1：夹带进被拒路径的 CR 不得进入日志行。
+        resp = client.get("/v1/users/%0dFORGED-LINE", headers=headers())
+        log_text = proxy.dump_log()
+        check(
+            "[passthrough-sec] L1: 被拒路径的日志不含 CR 伪造内容",
+            resp.status_code == 403
+            and "FORGED-LINE" in log_text
+            and "\rFORGED-LINE" not in log_text,
+            f"{resp.status_code} cr_present={chr(13) + 'FORGED-LINE' in log_text}",
+        )
         client.close()
     finally:
         proxy.stop()
@@ -1432,7 +1633,9 @@ def main() -> int:
         run_session_base_url_case(server.base_url)
         run_probe_case(server.base_url)
         run_passthrough_case(server.base_url)
+        run_passthrough_security_case(server.base_url)
         run_body_limit_case(server.base_url)
+        run_auth_throttle_case(server.base_url)
         run_multi_key_case(server.base_url)
     finally:
         server.stop()

@@ -4,6 +4,7 @@ Pure-logic unit tests: no Playwright, no network required.
 Run from the project root:
     python tests/test_units.py
 
+
 纯逻辑单元测试，不依赖 Playwright，也不需要联网。
 
 运行方式（项目根目录）：
@@ -129,6 +130,7 @@ def test_session_file() -> None:
 
     # load_session() caches the parsed file (it runs on every request); a replaced file
     # must still be visible.
+    #
     # load_session() 会缓存解析结果（它每个请求都会跑）；文件被替换后必须仍能被看到。
     (tmp / "session.json").write_text('{"authorization": "Bearer first"}', encoding="utf-8")
     check("首次读取成功", store.load_session(settings).authorization == "Bearer first")
@@ -143,6 +145,7 @@ def test_session_file() -> None:
     )
     # An invalid file must not be cached as a failure either: once it is fixed, the valid
     # credentials must be visible immediately.
+    #
     # 无效文件同样不得把"失败"缓存下来：修好之后必须能立刻读到有效凭证。
     (tmp / "session.json").write_text('{"cookie": ""}', encoding="utf-8")
     try:
@@ -502,6 +505,7 @@ def test_credentials_are_valid() -> None:
             open_webui_base_url=server.base_url,
             # Both candidate prefixes must be probed, otherwise the SPA case below
             # would depend on the ambient .env
+            #
             # 两个候选前缀都必须被探测，否则下面的 SPA 用例会受本机 .env 影响
             upstream_api_style="auto",
         )
@@ -552,6 +556,7 @@ def test_language_detection() -> None:
         # CLI flag wins over everything
         # CLI 参数优先于一切
         check("--lang zh 强制中文", lang_module.resolve_language("zh") == "zh")
+        check("--lang zh-CN 等价于 zh", lang_module.resolve_language("zh-CN") == "zh")
         check("--lang en 强制英文", lang_module.resolve_language("en") == "en")
 
         # System detection via POSIX-style env vars
@@ -575,6 +580,8 @@ def test_language_detection() -> None:
         # 消息查表跟随当前语言
         lang_module.configure("zh")
         check("zh 输出中文", "启动失败" in lang_module.t("startup_failed", exc="boom"))
+        lang_module.configure("zh-CN")
+        check("zh-CN 输出中文", "启动失败" in lang_module.t("startup_failed", exc="boom"))
         lang_module.configure("en")
         check("en 输出英文", "Startup failed" in lang_module.t("startup_failed", exc="boom"))
         lang_module.configure("fr")
@@ -1058,6 +1065,10 @@ def test_review_fixes() -> None:
     check("--lang=zh 等号形式生效", lang_module.current() == "zh", lang_module.current())
     proxy._preconfigure_language(["--lang", "en"])
     check("--lang en 空格形式仍生效", lang_module.current() == "en", lang_module.current())
+    proxy._preconfigure_language(["--language=zh-CN", "--check"])
+    check("--language=zh-CN 等号形式生效", lang_module.current() == "zh", lang_module.current())
+    proxy._preconfigure_language(["-l", "en"])
+    check("-l 空格形式生效", lang_module.current() == "en", lang_module.current())
     proxy._preconfigure_language(["--port", "9000"])
     check("没有 --lang 时不改变语言", lang_module.current() == "en", lang_module.current())
     lang_module.configure(lang_module.detect_system_language())
@@ -2362,6 +2373,446 @@ def test_upstream_hardening() -> None:
     )
 
 
+def test_security_review_round4() -> None:
+    print("\n--- Security review round 4 (H1/M1/M2/M3/L1/L2/L3/L5/L6/L7) / 安全审查第四轮回归 ---")
+    import asyncio
+    from urllib.parse import quote
+
+    import atomic_json as atomic_json_module
+    import request_context as request_context_module
+    from config import normalize_passthrough_path
+    from starlette.requests import Request as StarletteRequest
+
+    # --- H1: the allowlist is checked on a normalized, dot-free path ------------
+    # --- H1：白名单基于归一化后的无点段路径判定 ---
+    check(
+        "H1: 归一化拒绝父段、反斜杠与控制字符",
+        normalize_passthrough_path("images/../../api/config") is None
+        and normalize_passthrough_path("images/..%2f..%2fapi/config") is None
+        and normalize_passthrough_path("images\\..\\api") is None
+        and normalize_passthrough_path("images/\x0ax") is None,
+        str(
+            [
+                normalize_passthrough_path(value)
+                for value in ("images/../../api/config", "images/..%2f..%2fapi/config")
+            ]
+        ),
+    )
+    check(
+        "H1: 归一化折叠空段与 . 段",
+        normalize_passthrough_path("/images//./x/") == "images/x",
+        str(normalize_passthrough_path("/images//./x/")),
+    )
+    check(
+        "H1: 穿越路径被白名单拒绝（PASSTHROUGH_ALLOW=* 同样拒绝）",
+        not config_module.settings.passthrough_permits("images/../../api/config")
+        and not config_module.settings.passthrough_permits("images/%2e%2e/%2e%2e/api/config")
+        and not dataclasses.replace(
+            config_module.settings, passthrough_allow_all=True
+        ).passthrough_permits("images/../../api/config"),
+    )
+    check(
+        "H1: 正常子路径仍然放行、非白名单路径仍然拒绝",
+        config_module.settings.passthrough_permits("images")
+        and config_module.settings.passthrough_permits("images/x/y")
+        and not config_module.settings.passthrough_permits("users"),
+    )
+    check(
+        "H1: 纵深防御——解析后的最终路径也要落在白名单内",
+        proxy._target_stays_within_allowlist("/api/v1", "images/x")
+        and not proxy._target_stays_within_allowlist("/api/v1", "images/../../api/config"),
+    )
+    env_backup = dict(os.environ)
+    try:
+        os.environ["PASSTHROUGH_ALLOW"] = "/responses/, ..,images"
+        allow = config_module.load_settings()
+        check(
+            "H1: 白名单条目也归一化，无法指代路径的条目被丢弃",
+            allow.passthrough_allow == ["responses", "images"],
+            str(allow.passthrough_allow),
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
+
+    # --- M1: an upstream header outside latin-1 must not become a 500 ----------
+    # --- M1：上游非 latin-1 响应头不得变成 500 ---
+    headers = proxy._as_response_headers(
+        [("X-Weird", "中文"), ("Content-Type", "text/event-stream; charset=utf-8")]
+    )
+    check(
+        "M1: 非 latin-1 响应头被替换而不是抛异常",
+        headers.get("x-weird") == "??" and headers.get("content-type") is not None,
+        repr(headers.get("x-weird")),
+    )
+    check(
+        "M1: media_type 经同一清洗",
+        proxy._latin1_safe("application/json; 中文") == "application/json; ??"
+        and proxy._latin1_safe("text/event-stream") == "text/event-stream",
+        repr(proxy._latin1_safe("application/json; 中文")),
+    )
+
+    # --- M2: one capped reader shared by every route ----------------------------
+    # --- M2：所有路由共用一个限量读取 ---
+    def _body_request(body: bytes, declared: object) -> StarletteRequest:
+        delivered = False
+
+        async def receive():
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.disconnect"}
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        raw_headers = []
+        if declared is not None:
+            raw_headers.append((b"content-length", str(declared).encode()))
+        return StarletteRequest(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/images",
+                "query_string": b"",
+                "headers": raw_headers,
+                "client": ("203.0.113.7", 1234),
+                "server": ("test", 80),
+                "scheme": "http",
+            },
+            receive,
+        )
+
+    original_settings = proxy.settings
+    proxy.settings = dataclasses.replace(original_settings, max_body_bytes=64)
+    try:
+        async def _under_cap():
+            return await proxy._read_body_capped(_body_request(b"x" * 32, 32))
+
+        check("M2: 未超限的请求体正常读出", asyncio.run(_under_cap()) == b"x" * 32)
+
+        async def _over_declared():
+            return await proxy._read_body_capped(_body_request(b"x" * 128, 128))
+
+        declared_code = None
+        try:
+            asyncio.run(_over_declared())
+        except proxy.HttpError as exc:
+            declared_code = exc.status_code
+        check("M2: 声明长度超限直接 413", declared_code == 413, str(declared_code))
+
+        async def _over_chunked():
+            return await proxy._read_body_capped(_body_request(b"x" * 128, None))
+
+        chunked_code = None
+        try:
+            asyncio.run(_over_chunked())
+        except proxy.HttpError as exc:
+            chunked_code = exc.status_code
+        check("M2: 无声明长度的超限请求体也被 413 拦下", chunked_code == 413, str(chunked_code))
+    finally:
+        proxy.settings = original_settings
+
+    # --- M3: credential file permissions and cleanup ----------------------------
+    # --- M3：凭证文件权限与失败清理 ---
+    m3_dir = Path(tempfile.mkdtemp())
+    m3_target = m3_dir / "creds.json"
+    real_fsync = os.fsync
+    os.fsync = lambda descriptor: (_ for _ in ()).throw(OSError("simulated crash"))
+    failed = False
+    try:
+        atomic_json_module.atomic_write_json(m3_target, {"authorization": "Bearer secret"})
+    except OSError:
+        failed = True
+    finally:
+        os.fsync = real_fsync
+    check(
+        "M3: 写入失败后不残留含凭证的 .tmp",
+        failed and not m3_target.exists() and not (m3_dir / "creds.json.tmp").exists(),
+        str(sorted(item.name for item in m3_dir.iterdir())),
+    )
+    atomic_json_module.atomic_write_json(m3_target, {"authorization": "Bearer secret"})
+    if os.name == "posix":
+        mode = m3_target.stat().st_mode & 0o777
+        check("M3: 凭证文件以 0600 落盘（POSIX）", mode == 0o600, oct(mode))
+    else:
+        print("  [skip] M3 权限位检查：本平台为 " + os.name + " / POSIX-only")
+
+    # --- L1: untrusted text is stripped of control characters before logging ----
+    # --- L1：不可信文本进日志前先剔除控制字符 ---
+    check(
+        "L1: 控制字符被清洗",
+        request_context_module.sanitize_log_text("/v1/users/\r\nFORGED\x00") == "/v1/users/FORGED",
+        repr(request_context_module.sanitize_log_text("/v1/users/\r\nFORGED\x00")),
+    )
+    forbidden_line = lang_module.t(
+        "passthrough_forbidden_log",
+        path=request_context_module.sanitize_log_text("/v1/users/\rFORGED-LINE"),
+    )
+    check(
+        "L1: 被拒路径的日志行不含 CR/LF",
+        "\r" not in forbidden_line and "\n" not in forbidden_line and "FORGED-LINE" in forbidden_line,
+        repr(forbidden_line),
+    )
+
+    # --- L2: the query is rebuilt from raw bytes --------------------------------
+    # --- L2：查询串按原始字节重建 ---
+    check(
+        "L2: 字面 # 被编码，已编码序列保持原样",
+        quote("a=1#b=2", safe=proxy._QUERY_SAFE) == "a=1%23b=2"
+        and quote("a=1%23b", safe=proxy._QUERY_SAFE) == "a=1%23b",
+        quote("a=1#b=2", safe=proxy._QUERY_SAFE),
+    )
+
+    # --- L3: repeated bad keys are throttled per client address -----------------
+    # --- L3：同一地址反复猜错会被节流 ---
+    def _auth_request(token: str, host: str = "203.0.113.9") -> StarletteRequest:
+        return StarletteRequest(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/v1/models",
+                "query_string": b"",
+                "headers": [(b"authorization", f"Bearer {token}".encode())],
+                "client": (host, 1234),
+                "server": ("test", 80),
+                "scheme": "http",
+            }
+        )
+
+    proxy_settings_backup = proxy.settings
+    proxy.settings = dataclasses.replace(
+        proxy_settings_backup, proxy_api_key="right-key", proxy_api_keys={}, auth_failure_limit=3, auth_failure_window=60.0
+    )
+    proxy._auth_failures.clear()
+    try:
+        codes = []
+        retry_after = None
+        for _ in range(4):
+            try:
+                proxy.require_proxy_key(_auth_request("wrong-key"))
+                codes.append(200)
+            except proxy.HttpError as exc:
+                codes.append(exc.status_code)
+                if exc.status_code == 429:
+                    retry_after = (exc.headers or {}).get("Retry-After")
+        check("L3: 达到上限后以 429 + Retry-After 作答", codes == [401, 401, 401, 429] and bool(retry_after), f"{codes} retry={retry_after}")
+
+        # A valid key clears the streak, and another address is unaffected.
+        # 有效 Key 会清零计数；其它地址不受影响。
+        try:
+            proxy.require_proxy_key(_auth_request("right-key"))
+            cleared = True
+        except proxy.HttpError:
+            cleared = False
+        try:
+            proxy.require_proxy_key(_auth_request("wrong-key", host="203.0.113.10"))
+            other = 200
+        except proxy.HttpError as exc:
+            other = exc.status_code
+        check("L3: 成功鉴权清零计数，其它地址不受牵连", cleared and other == 401, f"cleared={cleared} other={other}")
+    finally:
+        proxy.settings = proxy_settings_backup
+        proxy._auth_failures.clear()
+
+    # --- L5: background tasks do not inherit the request id ---------------------
+    # --- L5：后台任务不再继承请求的关联 id ---
+    async def _background_id() -> tuple:
+        request_context_module.bind_request_id("client-request-id")
+        seen: list = []
+
+        async def job() -> None:
+            seen.append(request_context_module.current_request_id())
+
+        await runner._spawn_background_task(job())
+        return seen, request_context_module.current_request_id()
+
+    seen_ids, parent_id = asyncio.run(_background_id())
+    check(
+        "L5: 后台任务内 id 为空，请求上下文不受影响",
+        seen_ids == [""] and parent_id == "client-request-id",
+        f"task={seen_ids} parent={parent_id!r}",
+    )
+
+    # --- L6: a reloaded cache replaces the in-memory state ----------------------
+    # --- L6：缓存重载是整体替换 ---
+    cache_path = Path(tempfile.mkdtemp()) / "probe.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": mprobe.CACHE_VERSION,
+                "models": {"a": mprobe.ModelProbe(fingerprint="f1", status=mprobe.STATUS_OK).to_dict()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache = mprobe.ModelProbeCache(cache_path)
+    cache.load()
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": mprobe.CACHE_VERSION,
+                "models": {"b": mprobe.ModelProbe(fingerprint="f2", status=mprobe.STATUS_OK).to_dict()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache.load()
+    check(
+        "L6: 外部改写过的缓存整体替换，旧条目不再残留",
+        len(cache) == 1 and cache.entry("b") is not None and cache.entry("a") is None,
+        f"entries={[name for name in ('a', 'b') if cache.entry(name) is not None]}",
+    )
+
+    # --- L7: the lock file pins every runtime dependency with a hash ------------
+    # --- L7：锁文件把所有运行时依赖精确锁定并带哈希 ---
+    lock_lines = (REPO_ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines()
+    pinned = [line for line in lock_lines if "==" in line and not line.startswith("#")]
+    hashes = [line for line in lock_lines if line.strip().startswith("--hash=sha256:")]
+    check(
+        "L7: 锁文件每一条都精确锁定且带 sha256",
+        len(pinned) >= 10 and len(hashes) == len(pinned),
+        f"{len(pinned)} pinned / {len(hashes)} hashed",
+    )
+    check(
+        "L7: 锁文件覆盖全部直接依赖",
+        all(
+            any(line.startswith(name + "==") for line in pinned)
+            for name in ("fastapi", "uvicorn", "httpx", "python-dotenv", "pydantic")
+        ),
+        str(pinned[:3]),
+    )
+
+
+def test_audit_followups_round5() -> None:
+    print("\n--- Audit follow-ups round 5 (I2, I9) / 审查跟进第五轮（I2、I9）---")
+    import argparse
+    import asyncio
+    import logging
+    import re as re_module
+
+    # --- I2: the metadata wait records a real defect instead of swallowing it -----
+    # --- I2：元信息等待会记录真实缺陷，而不是吞掉 ---
+    captured: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    runner_logger = logging.getLogger("webui-proxy.runner")
+    handler = _Capture()
+    runner_logger.addHandler(handler)
+    previous_level = runner_logger.level
+    runner_logger.setLevel(logging.DEBUG)
+    previous_wait = runner.INSTANCE_META_WAIT
+    runner.INSTANCE_META_WAIT = 0.05  # keep the timeout case fast / 让超时用例跑得快
+    try:
+        async def _exercise() -> tuple:
+            async def boom() -> None:
+                raise ValueError("metadata exploded")
+
+            failing = asyncio.create_task(boom())
+            await asyncio.sleep(0)  # let it fail before the wait starts / 先让它失败
+            propagated: list = []
+            try:
+                await runner._await_instance_meta(failing)
+            except BaseException as exc:  # noqa: BLE001 - the point is that nothing escapes
+                propagated.append(exc)
+
+            async def slow() -> None:
+                await asyncio.sleep(5)
+
+            pending = asyncio.create_task(slow())
+            try:
+                await runner._await_instance_meta(pending)
+            except BaseException as exc:  # noqa: BLE001
+                propagated.append(exc)
+            survived = not pending.done()
+            pending.cancel()
+            try:
+                await pending
+            except asyncio.CancelledError:
+                pass
+            return propagated, survived
+
+        propagated, survived = asyncio.run(_exercise())
+    finally:
+        runner_logger.removeHandler(handler)
+        runner_logger.setLevel(previous_level)
+        runner.INSTANCE_META_WAIT = previous_wait
+
+    check(
+        "I2: 刷新任务的真实异常被记录，且不向调用方传播",
+        propagated == [] and any("metadata exploded" in message for message in captured),
+        f"propagated={propagated} captured={captured}",
+    )
+    check(
+        "I2: 超时只结束等待（不记异常），刷新任务继续运行",
+        survived and len(captured) == 1,
+        f"survived={survived} captured={captured}",
+    )
+
+    # --- I9: one adoption point keeps both runtime holders in step ----------------
+    # --- I9：唯一采纳入口让两个运行时持有者保持一致 ---
+    saved = (proxy.settings, proxy.upstream, runner.settings, runner.upstream)
+    try:
+        proxy._apply_cli_overrides(
+            argparse.Namespace(host=None, port=0, lang=lang_module.LANG_AUTO)
+        )
+        adopted = proxy.settings
+        check(
+            "I9: CLI 覆盖后两个持有者是同一实例（--port 0 不被吞掉）",
+            adopted.proxy_port == 0
+            and runner.settings is adopted
+            and runner.upstream is proxy.upstream,
+            f"port={adopted.proxy_port} shared_settings={runner.settings is adopted} "
+            f"shared_client={runner.upstream is proxy.upstream}",
+        )
+        check(
+            "I9: config.settings 仍是启动默认值（运行时实例不污染模块常量）",
+            config_module.settings is not adopted,
+            f"config.settings.port={config_module.settings.proxy_port}",
+        )
+
+        proxy._apply_cli_overrides(
+            argparse.Namespace(host=None, port=None, lang=lang_module.LANG_AUTO)
+        )
+        check(
+            "I9: 无覆盖项时不重建（两个持有者继续共用同一实例）",
+            proxy.settings is adopted and runner.settings is adopted,
+            f"same={proxy.settings is adopted}",
+        )
+    finally:
+        proxy.settings, proxy.upstream, runner.settings, runner.upstream = saved
+
+    # The invariant only holds while exactly these two modules import the module-level
+    # settings; a third one would silently read the un-overridden startup default.
+    #
+    # 该不变式只在"恰好这两个模块 import 模块级 settings"时成立；第三个模块会静默地
+    # 读到未经 CLI 覆盖的启动默认值。
+    holders: list = []
+    # Leading whitespace allowed: app.py imports settings inside a `try:` block (the
+    # import-time configuration error is turned into a friendly exit).
+    #
+    # 允许行首空白：app.py 在 `try:` 块里导入（import 期的配置错误会被翻译成友好退出）。
+    import_pattern = re_module.compile(
+        r"^\s*from config import\s+(\([^)]*\)|[^\n(]+)", re_module.MULTILINE
+    )
+    for path in sorted(REPO_ROOT.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for match in import_pattern.finditer(text):
+            names = {
+                name.strip().split(" as ")[0]
+                for name in re_module.split(r"[,\s()]+", match.group(1))
+                if name.strip()
+            }
+            if "settings" in names:
+                holders.append(path.name)
+    check(
+        "I9: 只有 app 与 probe_runner 持有 config.settings",
+        sorted(holders) == ["app.py", "probe_runner.py"],
+        str(holders),
+    )
+
+
 if __name__ == "__main__":
     test_session_roundtrip()
     test_session_file()
@@ -2393,6 +2844,8 @@ if __name__ == "__main__":
     test_probe_health_state()
     test_body_cap()
     test_upstream_hardening()
+    test_security_review_round4()
+    test_audit_followups_round5()
 
     total = len(PASSED) + len(FAILED)
     print("\n" + "=" * 60)

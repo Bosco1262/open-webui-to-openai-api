@@ -27,6 +27,7 @@ every single request.
 This module is deliberately free of HTTP: it parses upstream error text, builds
 the probe payloads, and owns the cache. Sending the requests is the caller's job.
 
+
 逐模型探测缓存：通过"问引擎"而不是"信元数据"来确定上游真正接受什么。
 
 两类事实一起获取并一起缓存，因为它们来自同一批最小请求：
@@ -202,6 +203,7 @@ def extract_effort_candidates(error_text: str) -> List[str]:
     Returns [] when nothing could be extracted; the caller then falls back to
     sweeping the full canonical list, so an unparseable upstream stays usable.
 
+
     从上游报错里提取所有可能的可接受挡位。
 
     理解三种真实措辞：
@@ -261,6 +263,7 @@ def extract_default_effort(error_text: str) -> Optional[str]:
 
     The previous implementation guessed this ("medium" or the median of the
     accepted list); the honest answer is None when the engine does not say.
+
 
     从上游报错里提取引擎自己声明的默认挡位（如 "xhigh (default)" / "default is xhigh"）。
 
@@ -326,6 +329,7 @@ def parameter_of_error(error_text: str) -> Optional[str]:
     None when the error cannot be attributed -- the caller then probes the merged
     parameters one by one instead of guessing.
 
+
     把上游 400 归因到引发它的请求参数。
 
     优先使用 pydantic 的 `loc`（精确），其次关键词匹配；无法归因时返回 None ——
@@ -359,6 +363,7 @@ def effort_payload(model_id: str, effort: str) -> Dict[str, Any]:
 
     max_tokens=1 bounds the worst case where an upstream ignores the field and
     actually generates.
+
 
     携带一个思考挡位值的最小补全请求。
 
@@ -472,6 +477,7 @@ def response_has_reasoning(body: str) -> Optional[bool]:
     None means "cannot tell" (unparseable body, or a choice that carries neither
     content nor reasoning), which callers must not turn into a claim.
 
+
     读取补全响应体，判断模型是否产出了思考文本。
 
     None 表示"看不出来"（响应体无法解析，或该 choice 既没有 content 也没有
@@ -524,6 +530,7 @@ def build_reasoning_info(
     Unknown facts are omitted rather than guessed (OpenRouter does the same: some of
     its models carry nothing but {"mandatory": false}).
 
+
     组装 /v1/models 上每个模型的 "reasoning" 对象，采用 OpenRouter 的形状：
     supported_efforts / default_effort / default_enabled / mandatory。
 
@@ -570,6 +577,7 @@ def derive_reasoning_capability(
     other than "off", or thinking was observed on a request without the field.
 
     Returns None when neither source is conclusive.
+
 
     模型是否具备思考能力：引擎接受至少一个"非关闭"挡位，或在未携带该字段的请求里
     观察到了思考内容。两个来源都得不出结论时返回 None。
@@ -695,6 +703,7 @@ class ModelProbeCache:
     a previous probe left it inconclusive and its backoff has expired, or when the
     operator forces a refresh.
 
+
     model_id -> ModelProbe，以 JSON 持久化在凭证文件旁边。
 
     缓存是"我们实证过一次的结论"与"/v1/models 对外声明"之间的契约：只有当引擎指纹
@@ -716,9 +725,20 @@ class ModelProbeCache:
     def load(self) -> None:
         """
         Read the cache file (idempotent, but re-read when the file changed on disk).
-        A missing, corrupt or older-version file simply starts empty -- a re-probe is
-        annoying, not fatal. Parse failures are not cached: once fixed, the file is
-        visible on the next load().
+
+        A successfully parsed, version-matching file REPLACES the in-memory state (L6):
+        the file was previously merged into it, so a model an operator had pruned on
+        disk kept being served from memory until something else happened to drop it. A
+        missing, corrupt or older-version file leaves the in-memory state alone instead
+        (it has no authoritative replacement to offer) -- and is never cached, so once
+        fixed it is visible on the next load().
+
+        读取缓存文件（幂等，但文件在磁盘上变化后会重新读取）。
+
+        解析成功且版本匹配的文件会**整体替换**内存状态（L6）：此前是合并进去的，于是运维
+        在磁盘上删掉的模型会继续从内存里被输出，直到别的原因把它清掉。文件缺失、损坏或
+        版本较旧时反而保持内存状态不变（它们没有可用的权威替代内容），且失败结果一律不缓存，
+        因此修好后下一次 load() 就能看到。
         """
         try:
             stat = self._path.stat()
@@ -754,9 +774,15 @@ class ModelProbeCache:
         models = raw.get("models")
         if not isinstance(models, dict):
             return
+        # Build the replacement first, then swap it in: the file is the authority, and
+        # nothing half-read should ever become the live state.
+        #
+        # 先构造替代内容再整体换上：文件才是权威，绝不能让"读到一半"的状态成为活动状态。
+        entries: Dict[str, ModelProbe] = {}
         for model_id, entry in models.items():
             if isinstance(entry, dict):
-                self._entries[str(model_id)] = ModelProbe.from_dict(entry)
+                entries[str(model_id)] = ModelProbe.from_dict(entry)
+        self._entries = entries
 
     def save(self) -> None:
         """
@@ -770,6 +796,7 @@ class ModelProbeCache:
         The write goes to a temporary file next to the cache (flushed and fsynced) and
         is then moved into place, so an interrupted write cannot leave a half-written
         cache behind -- see atomic_json.atomic_write_json.
+
 
         持久化缓存。
 
@@ -892,6 +919,7 @@ class ModelProbeCache:
         stripped from the incoming result, and the streak of disproved levels carries
         over while the engine fingerprint stays the same.
 
+
         保存一次完成的探测尝试。
 
         仍不完整（`partial`）的结果会继承失败计数，使"永远无法完全探清"的模型按
@@ -933,6 +961,7 @@ class ModelProbeCache:
         The entry keeps its previous status/data when it had any, and always gets a
         fresh backoff deadline so a broken model is not re-probed on every request.
 
+
         记录一次失败尝试，但不丢弃此前已确立的事实。
 
         若条目本来就有结论，则保留原状态/数据；无论如何都会写入新的退避截止时间，
@@ -968,6 +997,7 @@ class ModelProbeCache:
         make the model eligible for a background re-probe.
 
         Returns whether anything changed.
+
 
         从缓存列表里移除某个挡位（线上 400 刚刚证伪了它），并让该模型可以被后台重探。
         返回是否有改动。
@@ -1023,6 +1053,7 @@ class ModelProbeCache:
 
         With force=True every current model is returned for a full re-probe. Ids the list
         repeats are returned once, so no model is probed twice in a single round.
+
 
         将缓存与当前模型列表对齐，返回仍需探测的模型 id。
 

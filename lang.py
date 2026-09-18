@@ -1,15 +1,16 @@
 """
 User-facing message localization (zh / en).
 
-Language selection priority: CLI --lang flag > system language detection > English.
+Language selection priority: CLI flag (--lang / --language / -l) > system language detection > English.
 
 At import time the module initializes with the system language, so messages logged
 during import (e.g. config warnings) are localized too. The CLI flag overrides it
 later via configure().
 
+
 用户可见消息的本地化（zh / en）。
 
-语言选择优先级：CLI --lang 参数 > 系统语言检测 > 默认英文。
+语言选择优先级：CLI 参数（--lang / --language / -l）> 系统语言检测 > 默认英文。
 
 模块导入时即按系统语言初始化，因此 import 期的日志（如配置告警）也会被本地化；
 CLI 参数随后通过 configure() 覆盖。
@@ -23,8 +24,12 @@ import sys
 from typing import Dict, NamedTuple, Optional, Tuple
 
 LANG_ZH = "zh"
+LANG_ZH_CN = "zh-CN"
 LANG_EN = "en"
 LANG_AUTO = "auto"
+# Values accepted by the -l / --lang / --language CLI flag
+# -l / --lang / --language 命令行参数接受的取值
+LANG_CHOICES = (LANG_ZH, LANG_ZH_CN, LANG_EN, LANG_AUTO)
 
 
 class Message(NamedTuple):
@@ -33,6 +38,7 @@ class Message(NamedTuple):
 
     Replaces the previous (en, zh) tuple that callers indexed with 0/1 -- a magic
     index that quietly breaks the moment a third language is added.
+
 
     一条可翻译消息，两种语言各有具名字段。
 
@@ -191,6 +197,10 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     "err_invalid_api_key": (
         "Invalid proxy API key.",
         "无效的代理 API Key。",
+    ),
+    "err_too_many_attempts": (
+        "Too many invalid API key attempts from this address; retry in {retry} seconds.",
+        "该地址的无效 API Key 尝试次数过多；请在 {retry} 秒后重试。",
     ),
     "err_invalid_json": (
         "Request body is not valid JSON.",
@@ -404,8 +414,10 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
         "覆盖 PROXY_PORT",
     ),
     "cli_lang_help": (
-        "Output language: zh / en / auto (default: auto = follow the system language, English if undetectable)",
-        "输出语言：zh / en / auto（默认 auto = 系统语言，检测不到时用英文）",
+        "Output language (-l / --lang / --language): zh / zh-CN / en / auto "
+        "(default: auto = follow the system language, English if undetectable)",
+        "输出语言（-l / --lang / --language）：zh / zh-CN / en / auto"
+        "（默认 auto = 系统语言，检测不到时用英文）",
     ),
     # ---------------- per-model probe / 逐模型探测 ----------------
     "probe_cache_fresh": (
@@ -482,6 +494,10 @@ _MESSAGE_TEXTS: Dict[str, Tuple[str, str]] = {
     "instance_meta_failed": (
         "Instance metadata (/api/config) unavailable: {exc}",
         "实例元信息（/api/config）不可用：{exc}",
+    ),
+    "instance_meta_wait_failed": (
+        "Waiting for the instance-metadata (/api/config) refresh failed: {exc}",
+        "等待实例元信息（/api/config）刷新时出错：{exc}",
     ),
     "cli_probe_help": (
         "Force a refresh of the per-model probe cache, then exit",
@@ -724,14 +740,34 @@ def detect_system_language() -> str:
     return LANG_EN
 
 
+def normalize_language(value: Optional[str]) -> Optional[str]:
+    """
+    Canonicalize an explicitly given language tag: zh / zh-CN / en -> zh / en, and
+    return None for anything unrecognized (auto included), so the caller falls back
+    to system detection instead of letting an unknown value beat it.
+
+    规范化显式给出的语言标签：zh / zh-CN / en -> zh / en；无法识别时（含 auto）
+    返回 None，由调用方回退系统检测，避免未知取值压过检测结果。
+    """
+    if not value:
+        return None
+    primary = value.strip().replace("_", "-").split("-")[0].lower()
+    if primary == LANG_ZH:
+        return LANG_ZH
+    if primary == LANG_EN:
+        return LANG_EN
+    return None
+
+
 def resolve_language(cli_lang: Optional[str]) -> str:
     """
     Resolve the effective language: CLI flag > system detection > English.
 
     解析生效语言：CLI 参数 > 系统检测 > 英文。
     """
-    if cli_lang in (LANG_ZH, LANG_EN):
-        return cli_lang
+    explicit = normalize_language(cli_lang)
+    if explicit is not None:
+        return explicit
     return detect_system_language()
 
 
@@ -742,7 +778,8 @@ def configure(language: str) -> None:
     强制设置输出语言（供 --lang CLI 参数使用）。
     """
     global _current
-    _current = language if language in (LANG_ZH, LANG_EN) else LANG_EN
+    normalized = normalize_language(language)
+    _current = normalized if normalized is not None else LANG_EN
 
 
 def current() -> str:
@@ -758,10 +795,12 @@ def t(key: str, **fmt: object) -> str:
     """
     Translate a message key into the current language, then format it.
 
-    把消息 key 翻译成当前语言，再按参数格式化。
-
     Unknown keys fall back to the key itself, so a typo degrades gracefully instead
     of crashing at runtime.
+
+
+    把消息 key 翻译成当前语言，再按参数格式化。
+
     未知 key 回退为 key 本身，拼写错误只会退化为原文而不会在运行时崩溃。
     """
     message = _MESSAGES.get(key)

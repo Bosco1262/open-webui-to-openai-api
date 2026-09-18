@@ -43,7 +43,7 @@ Key points:
 - **Optional CORS**: configure `PROXY_CORS_ORIGINS` to let browser pages call this proxy directly (preflight is answered automatically); off by default to keep the exposure surface small.
 - **Model aliases**: map client-requested model names to real upstream model names via `MODEL_ALIASES`.
 - **Redacted credentials**: logs print only the token prefix and length; full credentials never end up in logs.
-- **Hardened by default**: the passthrough is an allowlist rather than "forward everything"; upstream redirects are refused instead of followed with your credentials; the upstream's `Set-Cookie` / `WWW-Authenticate` never reach the client; request bodies are size-capped while being read (chunked included); upstream error details stay in the log; and every request carries a correlation id you can grep.
+- **Hardened by default**: the passthrough is an allowlist rather than "forward everything" (checked on a normalized path, so `images/../../api/...` cannot escape it); upstream redirects are refused instead of followed with your credentials; the upstream's `Set-Cookie` / `WWW-Authenticate` never reach the client; request bodies are size-capped while being read (chunked included, and on every route); repeated invalid proxy keys are throttled per client address; upstream error details stay in the log; and every request carries a correlation id you can grep.
 
 ## Security defaults (at a glance)
 
@@ -54,7 +54,9 @@ Key points:
 | Upstream 3xx answers | refused (never followed) | point `OPEN_WEBUI_BASE_URL` at the final address |
 | Upstream `Set-Cookie` / `WWW-Authenticate` | stripped | — (clients authenticate with the proxy key) |
 | Plain `http` upstream on a LAN/non-loopback host | accepted, with one startup warning | put a TLS reverse proxy in front, or accept the trusted link |
-| Request body size | capped while reading (`MAX_BODY_BYTES`, 10 MiB) | `MAX_BODY_BYTES` |
+| Request body size | capped while reading (`MAX_BODY_BYTES`, 10 MiB) on every route, the passthrough included | `MAX_BODY_BYTES` |
+| Invalid proxy keys | throttled per client address after `AUTH_FAILURE_LIMIT` failures inside `AUTH_FAILURE_WINDOW` (429 + `Retry-After`) | `AUTH_FAILURE_LIMIT` (0 = off), `AUTH_FAILURE_WINDOW` |
+| Unauthenticated `/` and `/healthz` | minimal body (`{"status": "ok"}` / service + version); credential readiness, endpoint list, upstream address and probe health require a valid key | — |
 | Response headers | `X-Request-ID`, `Cache-Control: no-store, private`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` | — |
 
 ## Directory Structure
@@ -72,6 +74,7 @@ Key points:
 ├── atomic_json.py          # Shared atomic (flush + fsync + rename) JSON writer
 ├── request_context.py      # Per-request correlation id (contextvar + log formatter)
 ├── requirements.txt        # Minimal dependencies to run the service
+├── requirements.lock       # Pinned + hash-checked runtime set (reproducible install)
 ├── requirements-browser.txt# Optional: Playwright for browser login
 ├── requirements-dev.txt    # Optional: pytest, for running the tests
 ├── .env.example            # Configuration template
@@ -90,6 +93,17 @@ Python 3.11+ (the probe-refresh path uses `asyncio.TaskGroup`):
 ```bash
 pip install -r requirements.txt
 ```
+
+For a reproducible install, pin every runtime dependency to the exact version and hash this
+revision was verified against:
+
+```bash
+pip install --require-hashes -r requirements.lock
+```
+
+`requirements.lock` is generated on CPython 3.13 / Windows; the platform-specific wheels
+(`pydantic-core`) differ elsewhere, so regenerate it on your target platform with
+`uv pip compile --generate-hashes requirements.txt` (or `pip-compile --generate-hashes`).
 
 If you want the "browser login to capture credentials" path, you also need:
 
@@ -139,12 +153,13 @@ python app.py --port 9000  # Temporarily override the listen port
 Output language (logs, banner, CLI help, error messages):
 
 ```bash
-python app.py --lang zh    # Force Chinese output
-python app.py --lang en    # Force English output
-python app.py --lang auto  # Follow the system language (default), fall back to English
+python app.py --lang zh     # Force Chinese output
+python app.py --lang zh-CN  # zh-CN is accepted as an alias of zh
+python app.py --lang en     # Force English output
+python app.py --lang auto   # Follow the system language (default), fall back to English
 ```
 
-Selection priority: `--lang` flag > system language detection > English.
+Selection priority: `--lang` flag (also `-l` / `--language`) > system language detection > English.
 
 ### 4. Connect a client
 
@@ -205,13 +220,13 @@ for await (const part of stream) {
 
 | Method | Path                   | Auth | Description                                                        |
 | ---- | ---------------------- | -- | ---------------------------------------------------------------- |
-| GET  | `/`                    | No* | Service info and registered endpoints; the upstream address is returned only with a valid key |
-| GET  | `/healthz`             | No* | Health check always 200; upstream address, probed prefix and probe health returned only with a valid key |
+| GET  | `/`                    | No* | Service name and version; everything else (registered endpoints, credential readiness, upstream address) only with a valid key |
+| GET  | `/healthz`             | No* | Health check always 200; without a key the body is just `{"status": "ok"}` — version, credential readiness, upstream address, probed prefix and probe health require a valid key |
 | GET  | `/v1/models`           | Yes | Model list, normalized to the OpenAI structure, with probed capabilities / parameters / reasoning attached. The envelope also carries `x_open_webui` with the deployment's own metadata |
 | GET  | `/v1/models/{id}`      | Yes | Retrieve one model (`id` may contain slashes); 404 with an OpenAI-style error body when unknown |
 | POST | `/v1/chat/completions` | Yes | Chat completions, supports `stream: true`                         |
 | POST | `/v1/embeddings`       | Yes | Embeddings (upstream must support them)                           |
-| ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path, limited to `PASSTHROUGH_ALLOW` (default `images`, `audio`, `files`, `responses`); anything else is answered 403 without touching the upstream |
+| ANY  | `/v1/{path}`           | Yes | Catch-all passthrough to the same upstream path, limited to `PASSTHROUGH_ALLOW` (default `images`, `audio`, `files`, `responses`); anything else is answered 403 without touching the upstream. The path is normalized before it is checked and forwarded, so a `..` segment cannot escape the allowlist |
 
 Auth accepts both `Authorization: Bearer <key>` and `X-API-Key: <key>`, and accepts any of the keys from `PROXY_API_KEY` / `PROXY_API_KEYS`. If both are empty, no auth is enforced.
 
@@ -219,7 +234,7 @@ Every response carries an `X-Request-ID` header: the client's own value when it 
 
 Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint does (it has no pagination either; only Anthropic's and Gemini's differently-shaped APIs implement it).
 
-\* `/` and `/healthz` remain unauthenticated (probe/readiness-check friendly), but the `upstream` / `upstream_prefix` fields in the response are only returned when the request carries a valid key (or auth is disabled), to avoid leaking the upstream intranet domain on public deployments.
+\* `/` and `/healthz` remain unauthenticated (probe/readiness-check friendly), but without a valid key they return a minimal body: service name and version for `/`, `{"status": "ok"}` for `/healthz`. The credential readiness, the endpoint inventory and the `upstream` / `upstream_prefix` fields are only returned to an authenticated caller (or when auth is disabled entirely), so a public deployment does not hand out its topology.
 
 ## Configuration
 
@@ -246,6 +261,8 @@ Query parameters on `/v1/models` are ignored, exactly as OpenAI's own endpoint d
 | `MAX_BODY_BYTES`          | `10485760`      | Reject JSON request bodies larger than this (413). Enforced while reading, so a chunked body without `Content-Length` is capped too |
 | `MODEL_LIST_TTL`          | `10`            | Seconds the upstream model list is reused before refetching; `0` = fetch on every request            |
 | `ALLOW_INSECURE`          | `false`         | Safety interlock override: permits starting with no proxy key on a non-loopback address              |
+| `AUTH_FAILURE_LIMIT`      | `10`            | Failed proxy-key attempts from one client address before it is answered 429 with `Retry-After`; `0` disables the throttle |
+| `AUTH_FAILURE_WINDOW`     | `60`            | Seconds those failures are counted over                                                               |
 | `PASSTHROUGH_ALLOW`       | `images,audio,files,responses` | Subpaths the `/v1/*` passthrough may forward (exact or subpath match). `*` = unrestricted (the historical behavior); an explicitly empty value denies everything |
 | `MODEL_ALIASES`       | empty                   | JSON object, model name mapping                                                                      |
 | `LOG_LEVEL`           | `INFO`                  | `CRITICAL` / `ERROR` / `WARNING` / `INFO` / `DEBUG` / `TRACE`; invalid values fall back to `INFO`     |

@@ -8,6 +8,7 @@ Responsibilities:
 3. Forward requests as-is, and automatically fall back to the other prefix when
    the primary prefix returns 404 (route not found).
 
+
 上游转发层。
 
 职责：
@@ -27,6 +28,7 @@ import httpx
 
 import lang
 from config import Settings
+from request_context import sanitize_log_text
 from session_store import Session, looks_like_model_list
 
 logger = logging.getLogger("webui-proxy.upstream")
@@ -129,6 +131,7 @@ class UpstreamRequestInvalid(RuntimeError):
     failure, so retrying another prefix is pointless and it must reach the caller as a
     4xx (a bad request) rather than a 5xx (a broken upstream).
 
+
     请求根本没能构造或发出：非法的请求头值、HTTP 栈拒绝的 URL。
 
     刻意与 UpstreamUnavailable 区分：这是确定性的本地失败，换前缀重试毫无意义，
@@ -170,6 +173,7 @@ async def _reject_redirect(response: httpx.Response, url: str) -> None:
     which is a credential-exfiltration primitive whenever the upstream (or anything
     that can answer for it) redirects. A 3xx is therefore reported as an upstream
     failure; the fix is to write the final address into OPEN_WEBUI_BASE_URL.
+
 
     拒绝 3xx 回答而不是跟随（U-3）。
 
@@ -261,6 +265,7 @@ class UpstreamClient:
         path, but once it has failed (UpstreamUnavailable) the first burst of requests
         would otherwise each run the full candidate sweep against a dead upstream.
 
+
         确定上游前缀。返回 404 表示该路由不存在，401/403 表示路由存在但凭证失效。
 
         并发调用共用一次探测（D3）：正常情况下启动探测已经覆盖，但启动探测失败
@@ -287,6 +292,7 @@ class UpstreamClient:
         the process restarts. After PREFIX_FLIP_THRESHOLD consecutive fallbacks the
         cache is flipped to the prefix doing the work, so the next restart of that
         streak stops there instead of accumulating forever.
+
 
         记录最终是哪个候选前缀真正提供了服务（D12）。
 
@@ -326,6 +332,7 @@ class UpstreamClient:
         HTTP 200 + HTML page for an unknown path. The returned status is therefore
         meaningful to the startup self-check (_startup_check / --check), which merges
         "find the prefix + validate the credentials" into this single request.
+
 
         探测可用前缀，返回 (前缀, 探测请求的 HTTP 状态码)。
 
@@ -394,7 +401,9 @@ class UpstreamClient:
             lang.t("all_404", status=reported_status, prefix=self.prefix),
         )
         if last_text:
-            logger.debug(lang.t("resp_fragment", text=last_text))
+            # Upstream text, sanitized before it reaches a log line (L1).
+            # 上游文本，进日志前先清洗（L1）。
+            logger.debug(lang.t("resp_fragment", text=sanitize_log_text(last_text)))
         return self.prefix, reported_status
 
     # ------------------------------------------------------------------ #
@@ -424,6 +433,7 @@ class UpstreamClient:
         page, so the usual 404-based prefix fallback cannot be used here.
 
         Returns None on any failure -- this metadata is a bonus, never a requirement.
+
 
         GET Open WebUI 实例配置（`/api/config`）。
 
@@ -480,6 +490,7 @@ class UpstreamClient:
         build_request(client, url) is responsible for building the httpx.Request, so
         the caller decides the shape of body / headers; post() and forward() share
         the same fallback strategy.
+
 
         按候选前缀依次发送；主前缀返回 404（无此路由）则回退其它候选前缀。
 
@@ -557,6 +568,7 @@ class UpstreamClient:
         candidate. `extra_headers` is merged on top of the credential headers, which
         is how probe traffic identifies itself (D11).
 
+
         POST JSON 到上游；若主前缀返回 404（无此路由）则回退到其它候选前缀。
 
         请求体只序列化一次，供每次回退复用（R8）：传 `json=payload` 会按候选数把同一个
@@ -591,6 +603,7 @@ class UpstreamClient:
         Used by the /v1/* catch-all passthrough: builds no JSON body and forwards the
         caller-provided bytes and headers as-is.
 
+
         透传任意方法/路径的请求；主前缀 404 时回退其它候选（与 post 行为一致）。
 
         供 /v1/* 兜底透传使用：不构造 JSON 体，原样转发调用方给定的字节与请求头。
@@ -619,6 +632,7 @@ class UpstreamClient:
         The upstream's credential headers (Set-Cookie, WWW-Authenticate) are dropped
         (U-4): the client authenticates with the proxy key, and a forwarded Set-Cookie
         would hand it a usable upstream session that bypasses this proxy entirely.
+
 
         整理要透传给客户端的响应头，返回键值对列表。
 
